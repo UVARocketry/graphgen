@@ -1,0 +1,181 @@
+[
+	{
+		"read": "./debug_out_v2_small.txt",
+		"out": "./kalmanPos.png",
+		"font": {
+			"title": 32,
+			"xlabel": 20,
+			"ylabel": 20,
+			"legend": 20,
+			"tick": 16
+		},
+		"width": 15,
+		"height": 8,
+		"dpi": 100,
+		"annotations": [
+			{
+				"type": "text",
+				"line": 0,
+				"select": "max",
+				"x": {
+					// the :@ refers to the selected frame, so whatever frame y[0] is at
+					// its max
+					"value": "x:@",
+					"convert": []
+				},
+				"y": {
+					// the # refers to the selected line (in this case, 0)
+					"value": "y[#]:@",
+					"convert": []
+				},
+				// the {} are evaluated in order, so the first {} refers to the first 
+				// element of the values array, the number inside {} is how many decimal
+				// places to round to
+				"text": "Final apogee: {1} ft",
+				"values": [
+					{
+						"value": "y[#]:@",
+						"convert": []
+					}
+				],
+				"arrow": {
+					"dx": -5,
+					"dy": -2000
+				},
+				"style": {
+					"bbox": {
+						"boxstyle": "round,pad=0.3",
+						"facecolor": "white",
+						"alpha": 0.8
+					},
+					"fontsize": 15,
+					"color": "green"
+				}
+			},
+			{
+				"type": "text",
+				"line": 1,
+				"select": "max",
+				"x": {
+					"value": "x:@",
+					"convert": []
+				},
+				"y": {
+					"value": "y[#]:@",
+					"convert": []
+				},
+				"text": "Lower bound max: {1} ft (err: {1} ft)",
+				"values": [
+					{
+						"value": "y[#]:@",
+						"convert": []
+					},
+					{
+						"value": "y[#]:@",
+						"convert": ["-y[0]:max", "ge 0"]
+					}
+				],
+				"arrow": {
+					"dx": -4,
+					"dy": -1000
+				},
+				"style": {
+					"bbox": {
+						"boxstyle": "round,pad=0.3",
+						"facecolor": "white",
+						"alpha": 0.8
+					},
+					"fontsize": 12,
+					"color": "red"
+				}
+			},
+			{
+				"type": "text",
+				"line": 2,
+				"select": "min",
+				"x": {
+					"value": "x:@",
+					"convert": []
+				},
+				"y": {
+					"value": "y[#]:@",
+					"convert": []
+				},
+				"text": "Upper bound min: {1} ft (err: {1} ft)",
+				"values": [
+					{
+						"value": "y[#]:@",
+						"convert": []
+					},
+					{
+						"value": "y[#]:@",
+						"convert": ["-y[0]:max", "*-1", "ge 0"]
+					}
+				],
+				"arrow": {
+					"dx": -3,
+					"dy": -1000
+				},
+				"style": {
+					"bbox": {
+						"boxstyle": "round,pad=0.3",
+						"facecolor": "white",
+						"alpha": 0.8
+					},
+					"fontsize": 12,
+					"color": "red"
+				}
+			}
+		],
+		// filters reduce the range that the data is graphed over
+		"filter": {
+			"left": {
+				"key": ".timestamp_s",
+				"convert": ["ge 3800"],
+				// monotonic means that the key and conversion is a monotonic line
+				// which allows the filter to binary search to find the left edge 
+				"hint": "monotonic"
+			},
+			"right": {
+				"key": ".worldSpace.acc_mps2.z",
+				"convert": ["ge -80"],
+				// spike causes the search engine to search linearly until the condition
+				// is false then keep searching until the condition is true again
+				"hint": "spike"
+			}
+		},
+		"x": {
+			"key": ".timestamp_s",
+			"title": "timestamp (s)",
+			"convert": []
+		},
+		"y": [
+			{
+				"key": ".kalmanPosZ_m_agl",
+				"title": "kalman pos z",
+				"convert": ["m_to_ft"]
+			},
+			{
+				"key": ".lowerBound_m_agl",
+				"title": "apogee bound lower",
+				"convert": ["m_to_ft"]
+			},
+			{
+				"key": ".upperBound_m_agl",
+				"title": "apogee bound upper",
+				"convert": ["m_to_ft"]
+			},
+			{
+				"key": ".timestamp_s",
+				"title": "real apogee",
+				"convert": [
+					"-.timestamp_s",
+					// keys can also refer to specific spots like the last or first
+					// or max or min element of a key
+					"+.kalmanPosZ_m_agl:last",
+					"m_to_ft"
+				]
+			}
+		]
+	}
+]
