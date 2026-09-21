@@ -1,9 +1,9 @@
 !v2
 mode=human
 2
-.timestamp_ms
+.timestamp_s
 .idk
-.timestamp_ms
+.timestamp_s
 0
 2
 1.0

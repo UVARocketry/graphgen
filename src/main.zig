@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const lex = @import("parse/lexer.zig");
 const f = @import("fileref.zig");
 const Allocator = std.mem.Allocator;
 const first = @import("passes/first.zig");
@@ -73,6 +74,54 @@ pub fn resultsOf(
     }
 }
 
+pub fn doParse(
+    io: Io,
+    gpa: Allocator,
+    pageAlloc: Allocator,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    args: []const []const u8,
+) !void {
+    const graphFile = args[2];
+
+    const graphContents = try f.readFileToString(io, graphFile, pageAlloc);
+    defer pageAlloc.free(graphContents);
+
+    // var start = std.Io.Clock.awake.now(io);
+    // const p = try first.compilePlotJson(gpa, graphContents);
+    // defer p.deinit(gpa);
+    // const end = std.Io.Clock.awake.now(io);
+    // const nanos: f64 = @floatFromInt(start.durationTo(end).nanoseconds);
+    // std.debug.print("Pass 1 took {}s\n", .{nanos / 1.0e9});
+
+    var diagnostic: f.Diagnostic = .{
+        .gpa = gpa,
+        .extraRefs = .empty,
+        .filename = graphFile,
+        .message = &.{},
+        .from = .from(""),
+    };
+    defer diagnostic.deinit();
+
+    errdefer {
+        if (diagnostic.message.len != 0) {
+            diagnostic.print(stderr, graphContents) catch {};
+            stderr.flush() catch {};
+        }
+    }
+
+    var lexer: lex.Lexer = .init(graphContents);
+
+    while (try lexer.getNextTokenOptional(&diagnostic)) |tok| {
+        try stdout.print("{s} {t}\n", .{ lexer.currentTokenString, tok });
+        if (lexer.currentString) |str| {
+            try stdout.print("  - '{s}'\n", .{str});
+        }
+        if (lexer.currentNumber) |num| {
+            try stdout.print("  - {}\n", .{num});
+        }
+    }
+}
 pub fn doPlot(
     io: Io,
     gpa: Allocator,
@@ -234,7 +283,7 @@ pub fn main(init: std.process.Init) !void {
     // Stdout is for the actual output of your application, for example if you
     // are implementing gzip, then only the compressed bytes should be sent to
     // stdout, not any debugging messages.
-    var stdout_buffer: [1024 * 1024]u8 = undefined;
+    var stdout_buffer: [64]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
 
@@ -253,6 +302,9 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, subcommand, "plot")) {
         try doPlot(io, init.gpa, std.heap.page_allocator, stdout, stderr, args);
+        try stdout.flush();
+    } else if (std.mem.eql(u8, subcommand, "parse")) {
+        try doParse(io, init.gpa, std.heap.page_allocator, stdout, stderr, args);
         try stdout.flush();
     } else if (std.mem.eql(u8, subcommand, "list_keys")) {
         try listKeys(io, init.gpa, std.heap.page_allocator, stdout, args);
