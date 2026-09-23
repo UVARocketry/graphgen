@@ -13,7 +13,7 @@ pub const TokenType = enum {
     number,
 
     kwd_fn,
-    kwd_use,
+    kwd_import,
     kwd_foreign,
 
     keyref,

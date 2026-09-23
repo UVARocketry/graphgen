@@ -9,6 +9,20 @@ const Allocator = std.mem.Allocator;
 
 const mToFtConversion = "3.28084";
 
+// x86-esque variable instruction length format:
+// bytecode format:
+//
+// bit 0: =1 for keyref, =0 for operation
+//
+// for keyrefs:
+// - 7 bits for reference type (is axis reference is implicit by the ref type)
+//
+// operation type determines the number of 16 bit handles after the byte
+//
+// for operations:
+// - 7 bits for op type
+// - function calls have two 16 bit values after (start handle, bytecode len)
+
 pub const Keyref = packed struct {
     pub const Op = enum(u8) {
         get,
