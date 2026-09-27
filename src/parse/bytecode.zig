@@ -227,6 +227,14 @@ pub const BytecodeInterpreter = struct {
         return value;
     }
 
+    pub fn getTypeSizeForPush(tp: BytecodeOp.PushTypes) u32 {
+        inline for (@typeInfo(BytecodeOp.PushTypes).@"enum".fields) |field| {
+            if (field.value == @intFromEnum(tp)) {
+                return @sizeOf(GetTypeForPush(@enumFromInt(field.value)));
+            }
+        }
+        unreachable;
+    }
     pub fn GetTypeForPush(comptime tp: BytecodeOp.PushTypes) type {
         const str = @tagName(tp);
         if (std.mem.startsWith(u8, str, "keyref_")) {
@@ -379,6 +387,81 @@ pub const BytecodeInterpreter = struct {
         const last = self.popValue();
 
         return last;
+    }
+
+    pub fn getMaxStackUsage(self: *BytecodeInterpreter, range: BytecodeRef) !u32 {
+        var current: u32 = 0;
+        var max: u32 = 0;
+
+        const old = self.pos;
+        defer self.pos = old;
+
+        self.pos = range.start;
+        var lastPos: u32 = std.math.maxInt(u32);
+
+        while (self.pos < range.start + range.len) {
+            const op = self.eatOp();
+
+            if (self.pos == lastPos) {
+                return error.hwut;
+            }
+            lastPos = self.pos;
+
+            if (op.isKeyref) {
+                switch (op.rest.keyref) {
+                    .keyref_get,
+                    .value,
+                    .keyref_first,
+                    .axis_first,
+                    .keyref_last,
+                    .axis_last,
+                    .keyref_min,
+                    .axis_min,
+                    .keyref_max,
+                    .axis_max,
+                    .keyref_mean,
+                    .axis_mean,
+                    .keyref_prev,
+                    .axis_selection,
+                    .keyref_selection,
+                    .fn_arg,
+                    => {
+                        current += 1;
+                        max = @max(current, max);
+                        self.pos += getTypeSizeForPush(op.rest.keyref);
+                    },
+                }
+            } else {
+                switch (op.rest.operation) {
+                    // no change
+                    .negate, .ln, .exp, .sqrt, .abs => {},
+                    .plus,
+                    .minus,
+                    .times,
+                    .div,
+                    .max,
+                    .min,
+                    .pow,
+                    .gte,
+                    .gt,
+                    .lte,
+                    .lt,
+                    => {
+                        current -= 1;
+                    },
+                    .call => {
+                        const T = BytecodeOp.OpTypes.FnCallArgs;
+                        const v: T = self.eatType(T);
+                        const fnSize = try self.getMaxStackUsage(v.bytecode);
+                        max = @max(max, current + fnSize);
+                        current += 1;
+                        current -= v.argsPassed;
+                    },
+                }
+            }
+        }
+
+        return max;
     }
 };
 

@@ -298,7 +298,7 @@ pub fn cool(
     };
     defer builder.arr.deinit(gpa);
 
-    // fn times(a, b) = a * b;
+    // fn times(a, b) = a * b + a * b;
     // 1 + times(2, 3)
 
     try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .fn_arg } });
@@ -309,8 +309,19 @@ pub fn cool(
     try builder.addType(bc.BytecodeOp.PushTypes.FnArg, gpa, .{
         .argIndex = 0,
     });
-
     try builder.addOp(gpa, .{ .isKeyref = false, .rest = .{ .operation = .times } });
+
+    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .fn_arg } });
+    try builder.addType(bc.BytecodeOp.PushTypes.FnArg, gpa, .{
+        .argIndex = 1,
+    });
+    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .fn_arg } });
+    try builder.addType(bc.BytecodeOp.PushTypes.FnArg, gpa, .{
+        .argIndex = 0,
+    });
+    try builder.addOp(gpa, .{ .isKeyref = false, .rest = .{ .operation = .times } });
+
+    try builder.addOp(gpa, .{ .isKeyref = false, .rest = .{ .operation = .plus } });
 
     const fnRef: bc.BytecodeRef = .{
         .start = 0,
@@ -318,13 +329,10 @@ pub fn cool(
     };
 
     try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .value } });
+    try builder.addType(f32, gpa, 1.0);
+
+    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .value } });
     try builder.addType(f32, gpa, 2.0);
-    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .keyref_get } });
-    try builder.addType(
-        bc.BytecodeOp.PushTypes.KeyrefArg,
-        gpa,
-        .{ .keyrefId = 49 },
-    );
     try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .value } });
     try builder.addType(f32, gpa, 3.0);
 
@@ -353,11 +361,11 @@ pub fn cool(
 
     var cache: bc.ValueCache = .init(gpa);
 
-    var stackBuffer: [32]f32 = undefined;
+    var stackBuffer: [6]f32 = undefined;
 
     var bytecode: bc.BytecodeInterpreter = .{
         .bytecode = builder.arr.items,
-        .stackAllocator = gpa,
+        .stackAllocator = .failing,
         .valueStack = .initBuffer(&stackBuffer),
         .datastoreAllocator = gpa,
         .pos = 0,
@@ -368,6 +376,7 @@ pub fn cool(
             .cache = &cache,
         },
     };
+    std.debug.print("Stack usage: {}\n", .{try bytecode.getMaxStackUsage(restRef)});
 
     const value = try bytecode.execRange(restRef, 3);
     try stdout.print("{}\n", .{value});
