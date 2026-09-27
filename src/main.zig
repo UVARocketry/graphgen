@@ -8,6 +8,7 @@ const parseOut = @import("parse_txt.zig");
 const second = @import("passes/second.zig");
 const third = @import("passes/third.zig");
 const interpret = @import("passes/interpret.zig");
+const bc = @import("parse/bytecode.zig");
 
 const debuggraph_zig = @import("debuggraph_zig");
 
@@ -270,6 +271,108 @@ pub fn listKeys(
     }
 }
 
+pub fn cool(
+    io: Io,
+    gpa: Allocator,
+    pageAlloc: Allocator,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) !void {
+    var strDiagnostic: ?[]const u8 = null;
+    errdefer {
+        if (strDiagnostic) |s| {
+            stderr.print("{s}\n", .{s}) catch {};
+            stderr.flush() catch {};
+        }
+    }
+    const cols = try parseOut.parseDbgFile(io, gpa, pageAlloc, "./debug_out_v2_22M.txt", &strDiagnostic);
+    defer {
+        for (cols) |*c| {
+            c.deinit(gpa);
+        }
+        gpa.free(cols);
+    }
+
+    var builder: bc.BytecodeBuilder = .{
+        .arr = .empty,
+    };
+    defer builder.arr.deinit(gpa);
+
+    // fn times(a, b) = a * b;
+    // 1 + times(2, 3)
+
+    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .fn_arg } });
+    try builder.addType(bc.BytecodeOp.PushTypes.FnArg, gpa, .{
+        .argIndex = 1,
+    });
+    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .fn_arg } });
+    try builder.addType(bc.BytecodeOp.PushTypes.FnArg, gpa, .{
+        .argIndex = 0,
+    });
+
+    try builder.addOp(gpa, .{ .isKeyref = false, .rest = .{ .operation = .times } });
+
+    const fnRef: bc.BytecodeRef = .{
+        .start = 0,
+        .len = @intCast(builder.arr.items.len),
+    };
+
+    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .value } });
+    try builder.addType(f32, gpa, 2.0);
+    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .keyref_get } });
+    try builder.addType(
+        bc.BytecodeOp.PushTypes.KeyrefArg,
+        gpa,
+        .{ .keyrefId = 49 },
+    );
+    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .value } });
+    try builder.addType(f32, gpa, 3.0);
+
+    try builder.addOp(gpa, .{ .isKeyref = false, .rest = .{ .operation = .call } });
+    try builder.addType(bc.BytecodeOp.OpTypes.FnCallArgs, gpa, .{
+        .bytecode = fnRef,
+        .argsPassed = 2,
+    });
+
+    try builder.addOp(gpa, .{ .isKeyref = false, .rest = .{ .operation = .plus } });
+
+    const restRef: bc.BytecodeRef = .{
+        .start = fnRef.len,
+        .len = @intCast(builder.arr.items.len - fnRef.len),
+    };
+
+    var bcCols: std.ArrayList(bc.Frame) = try .initCapacity(gpa, cols.len);
+    defer bcCols.deinit(gpa);
+    for (cols) |c| {
+        // std.debug.print("{s}\n", .{c.name});
+        bcCols.appendAssumeCapacity(.{
+            .values = c.values,
+            .skip = c.skip,
+        });
+    }
+
+    var cache: bc.ValueCache = .init(gpa);
+
+    var stackBuffer: [32]f32 = undefined;
+
+    var bytecode: bc.BytecodeInterpreter = .{
+        .bytecode = builder.arr.items,
+        .stackAllocator = gpa,
+        .valueStack = .initBuffer(&stackBuffer),
+        .datastoreAllocator = gpa,
+        .pos = 0,
+        .store = .{
+            .leftFrame = .nil,
+            .rightFrame = .nil,
+            .frames = bcCols.items,
+            .cache = &cache,
+        },
+    };
+
+    const value = try bytecode.execRange(restRef, 3);
+    try stdout.print("{}\n", .{value});
+}
+
 pub fn main(init: std.process.Init) !void {
     // This is appropriate for anything that lives as long as the process.
     const arena: std.mem.Allocator = init.arena.allocator();
@@ -311,6 +414,8 @@ pub fn main(init: std.process.Init) !void {
         try stdout.flush();
     } else if (std.mem.eql(u8, subcommand, "resultsof")) {
         try resultsOf(io, init.gpa, std.heap.page_allocator, stdout, args);
+    } else if (std.mem.eql(u8, subcommand, "cool")) {
+        try cool(io, init.gpa, std.heap.page_allocator, stdout, stderr);
         try stdout.flush();
     } else {
         try stdout.print("unknown subcommand, got '{s}'\n", .{subcommand});
