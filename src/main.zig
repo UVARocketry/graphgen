@@ -9,6 +9,7 @@ const second = @import("passes/second.zig");
 const third = @import("passes/third.zig");
 const interpret = @import("passes/interpret.zig");
 const bc = @import("parse/bytecode.zig");
+const parse = @import("parse/parse.zig");
 
 const debuggraph_zig = @import("debuggraph_zig");
 
@@ -111,17 +112,20 @@ pub fn doParse(
         }
     }
 
-    var lexer: lex.Lexer = .init(graphContents);
+    const lexer: lex.Lexer = .init(graphContents);
 
-    while (try lexer.getNextTokenOptional(&diagnostic)) |tok| {
-        try stdout.print("{s} {t}\n", .{ lexer.currentTokenString, tok });
-        if (lexer.currentString) |str| {
-            try stdout.print("  - '{s}'\n", .{str});
-        }
-        if (lexer.currentNumber) |num| {
-            try stdout.print("  - {}\n", .{num});
-        }
-    }
+    var parser: parse.ParserPass1 = .{
+        .bytecodeStream = .{
+            .arr = .empty,
+        },
+        .keyrefTable = .empty,
+        .scope = .empty,
+        .lexer = lexer,
+    };
+
+    try parser.pass(gpa, &diagnostic);
+
+    _ = try stdout.write("");
 }
 pub fn doPlot(
     io: Io,
@@ -301,21 +305,42 @@ pub fn cool(
     // fn times(a, b) = a * b + a * b;
     // 1 + times(2, 3)
 
-    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .fn_arg } });
+    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{
+        .keyref = .{
+            .tp = .fn_arg,
+            .rest = .{ .no = 0 },
+        },
+    } });
     try builder.addType(bc.BytecodeOp.PushTypes.FnArg, gpa, .{
         .argIndex = 1,
     });
-    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .fn_arg } });
+
+    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{
+        .keyref = .{
+            .tp = .fn_arg,
+            .rest = .{ .no = 0 },
+        },
+    } });
     try builder.addType(bc.BytecodeOp.PushTypes.FnArg, gpa, .{
         .argIndex = 0,
     });
     try builder.addOp(gpa, .{ .isKeyref = false, .rest = .{ .operation = .times } });
 
-    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .fn_arg } });
+    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{
+        .keyref = .{
+            .tp = .fn_arg,
+            .rest = .{ .no = 0 },
+        },
+    } });
     try builder.addType(bc.BytecodeOp.PushTypes.FnArg, gpa, .{
         .argIndex = 1,
     });
-    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .fn_arg } });
+    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{
+        .keyref = .{
+            .tp = .fn_arg,
+            .rest = .{ .no = 0 },
+        },
+    } });
     try builder.addType(bc.BytecodeOp.PushTypes.FnArg, gpa, .{
         .argIndex = 0,
     });
@@ -328,12 +353,29 @@ pub fn cool(
         .len = @intCast(builder.arr.items.len),
     };
 
-    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .value } });
-    try builder.addType(f32, gpa, 1.0);
+    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .{
+        .tp = .keyref,
+        .rest = .{
+            .keyref = .min,
+        },
+    } } });
+    try builder.addType(bc.BytecodeOp.PushTypes.KeyrefArg, gpa, .{
+        .keyrefId = 49,
+    });
 
-    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .value } });
+    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{
+        .keyref = .{
+            .tp = .value,
+            .rest = .{ .no = 0 },
+        },
+    } });
     try builder.addType(f32, gpa, 2.0);
-    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{ .keyref = .value } });
+    try builder.addOp(gpa, .{ .isKeyref = true, .rest = .{
+        .keyref = .{
+            .tp = .value,
+            .rest = .{ .no = 0 },
+        },
+    } });
     try builder.addType(f32, gpa, 3.0);
 
     try builder.addOp(gpa, .{ .isKeyref = false, .rest = .{ .operation = .call } });
@@ -351,7 +393,10 @@ pub fn cool(
 
     var bcCols: std.ArrayList(bc.Frame) = try .initCapacity(gpa, cols.len);
     defer bcCols.deinit(gpa);
+    var maxFrame: u32 = 0;
     for (cols) |c| {
+        const frameCount: u32 = @intCast(c.values.len + c.skip);
+        maxFrame = @max(frameCount, maxFrame);
         // std.debug.print("{s}\n", .{c.name});
         bcCols.appendAssumeCapacity(.{
             .values = c.values,
@@ -359,7 +404,8 @@ pub fn cool(
         });
     }
 
-    var cache: bc.ValueCache = .init(gpa);
+    var cache: bc.ValueCache = .init();
+    defer cache.deinit(gpa);
 
     var stackBuffer: [6]f32 = undefined;
 
@@ -370,6 +416,7 @@ pub fn cool(
         .datastoreAllocator = gpa,
         .pos = 0,
         .store = .{
+            .maxFrame = maxFrame,
             .leftFrame = .nil,
             .rightFrame = .nil,
             .frames = bcCols.items,

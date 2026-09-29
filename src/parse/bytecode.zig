@@ -15,47 +15,61 @@ pub const BytecodeRef = struct {
     len: u16,
 };
 
+// TODO: use this
+
 pub const BytecodeOp = packed struct(u8) {
-    pub const PushTypes = enum(u7) {
+    pub const PushTypes = packed struct(u7) {
         pub const KeyrefArg = packed struct(u8) {
             keyrefId: u8,
         };
+
         pub const AxisArg = BytecodeRef;
 
         pub const Value = f32;
+
+        comptime {
+            std.debug.assert(@bitSizeOf(AxisArg) == @bitSizeOf(Value));
+        }
 
         pub const FnArg = packed struct(u8) {
             argIndex: u8,
         };
 
-        // for all keyref_ keys, the next 8 bits are which keyref it is
-        // for all axis_ keys, the next value is a BytecodeRef
+        pub const Tp = enum(u2) {
+            keyref,
+            axis,
+            value,
+            fn_arg,
+        };
 
-        /// just a plain keyref
-        keyref_get,
-        /// a 32 bit float, the float is the next 32 bits in the bytecode stream
-        value,
+        pub const AccessType = enum(u5) {
+            first,
+            last,
+            min,
+            max,
+            mean,
+            current,
+            prev,
 
-        keyref_first,
-        axis_first,
-        keyref_last,
-        axis_last,
-        keyref_min,
-        axis_min,
-        keyref_max,
-        axis_max,
+            pub fn toSaveType(s: AccessType) SaveTypes {
+                return switch (s) {
+                    .first => .first,
+                    .last => .last,
+                    .min => .min,
+                    .max => .max,
+                    .mean => .mean,
+                    .current => @panic("no"),
+                    .prev => @panic("no 2"),
+                };
+            }
+        };
 
-        keyref_mean,
-        axis_mean,
-
-        keyref_prev,
-
-        axis_selection,
-        keyref_selection,
-
-        /// access the `N-n`-th arg of a function, eat 8 bits for arg pos.
-        /// NOTE: the 8 bits are REVERSE INDEXED, thus 0 means last arg!
-        fn_arg,
+        tp: Tp,
+        rest: packed union(u5) {
+            keyref: AccessType,
+            axis: AccessType,
+            no: u5,
+        },
     };
 
     pub const OpTypes = enum(u7) {
@@ -77,19 +91,19 @@ pub const BytecodeOp = packed struct(u8) {
         /// After execution, POP retval, POP [argslen], PUSH retval
         call,
         /// POP 1, push ln(s[0])
-        ln,
+        sp_ln,
         /// POP 1, push e^s[0]
-        exp,
+        sp_exp,
         /// POP 2, push max(s[1], s[0])
-        max,
+        sp_max,
         /// POP 2, push min(s[1], s[0])
-        min,
+        sp_min,
         /// POP 1, push sqrt(s[0])
-        sqrt,
+        sp_sqrt,
         /// POP 1, push abs(s[0])
-        abs,
+        sp_abs,
         /// POP 2, push s[1]^s[0]
-        pow,
+        sp_pow,
         /// POP 2, push nan if s[1] < s[0], else push s[1]
         gte,
         /// POP 2, push nan if s[1] <= s[0], else push s[1]
@@ -98,6 +112,19 @@ pub const BytecodeOp = packed struct(u8) {
         lte,
         /// POP 2, push nan if s[1] >= s[0], else push s[1]
         lt,
+
+        pub fn isSpecialFn(self: OpTypes) bool {
+            const tag = @tagName(self);
+            if (std.mem.startsWith(u8, tag, "sp_")) return true;
+            return false;
+        }
+        pub fn argCountOf(self: OpTypes) ?u16 {
+            return switch (self) {
+                .sp_ln, .sp_exp, .sp_sqrt, .sp_abs => 1,
+                .sp_max, .sp_min, .sp_pow => 2,
+                .negate, .plus, .minus, .times, .div, .call, .gte, .gt, .lte, .lt => null,
+            };
+        }
     };
 
     isKeyref: bool,
@@ -141,6 +168,12 @@ pub const OptionalU31 = packed struct(u32) {
         }
         return self.value == other.value;
     }
+    pub fn orElse(self: OptionalU31, value: u32) u32 {
+        if (!self.hasval) {
+            return value;
+        }
+        return self.value;
+    }
 };
 
 pub const SavedValue = struct {
@@ -169,11 +202,9 @@ pub const SaveTypes = enum {
 
 pub const ValueCache = struct {
     map: std.EnumMap(SaveTypes, std.ArrayList(SavedValue)),
-    alloc: std.mem.Allocator,
 
-    pub fn init(alloc: std.mem.Allocator) ValueCache {
+    pub fn init() ValueCache {
         return .{
-            .alloc = alloc,
             .map = .init(.{
                 .first = .empty,
                 .last = .empty,
@@ -184,9 +215,9 @@ pub const ValueCache = struct {
         };
     }
 
-    pub fn deinit(self: *ValueCache) void {
-        for (self.map.values) |*i| {
-            i.deinit(self.alloc);
+    pub fn deinit(self: *ValueCache, alloc: std.mem.Allocator) void {
+        for (&self.map.values) |*i| {
+            i.deinit(alloc);
         }
     }
 };
@@ -195,22 +226,9 @@ pub const DataStore = struct {
     frames: []const Frame,
     leftFrame: OptionalU31,
     rightFrame: OptionalU31,
+    maxFrame: u32,
     cache: *ValueCache,
 };
-
-// ok so some weird things are starting to appear:
-//
-// BytecodeInterpreter is kinda intended to be an isolated thing, but it still needs global
-// ctx for calling functions (it also needs passed context for resolving keyvals and
-// axes and their derivations)
-//
-// it also needs parent context for resolving fn args hmmmmmm
-//
-// so technically we can static-analyze the bytecode and then produce a cache with
-// the correct :first, :last, etc resolutions AOT
-//
-// could we just in-place replace all fancy bytecodes (.keyref_, .axis_) with .value?
-// but that can get very complciated
 
 pub const BytecodeInterpreter = struct {
     bytecode: []const u8,
@@ -227,34 +245,23 @@ pub const BytecodeInterpreter = struct {
         return value;
     }
 
-    pub fn getTypeSizeForPush(tp: BytecodeOp.PushTypes) u32 {
-        inline for (@typeInfo(BytecodeOp.PushTypes).@"enum".fields) |field| {
+    pub fn getTypeSizeForPush(tp: BytecodeOp.PushTypes.Tp) u32 {
+        inline for (@typeInfo(BytecodeOp.PushTypes.Tp).@"enum".fields) |field| {
             if (field.value == @intFromEnum(tp)) {
                 return @sizeOf(GetTypeForPush(@enumFromInt(field.value)));
             }
         }
         unreachable;
     }
-    pub fn GetTypeForPush(comptime tp: BytecodeOp.PushTypes) type {
-        const str = @tagName(tp);
-        if (std.mem.startsWith(u8, str, "keyref_")) {
-            return BytecodeOp.PushTypes.KeyrefArg;
-        }
-        if (std.mem.startsWith(u8, str, "axis_")) {
-            return BytecodeOp.PushTypes.AxisArg;
-        }
-        if (std.mem.eql(u8, str, "value")) {
-            return BytecodeOp.PushTypes.Value;
-        }
-        if (std.mem.eql(u8, str, "fn_arg")) {
-            return BytecodeOp.PushTypes.FnArg;
-        }
-        @compileError(std.fmt.comptimePrint(
-            "Cannot determine type for enum value BytecodeValue.PushTypes.{t}",
-            .{tp},
-        ));
+    pub fn GetTypeForPush(comptime tp: BytecodeOp.PushTypes.Tp) type {
+        return switch (tp) {
+            .keyref => BytecodeOp.PushTypes.KeyrefArg,
+            .axis => BytecodeOp.PushTypes.AxisArg,
+            .value => BytecodeOp.PushTypes.Value,
+            .fn_arg => BytecodeOp.PushTypes.FnArg,
+        };
     }
-    pub fn eatPushArgs(self: *BytecodeInterpreter, comptime tp: BytecodeOp.PushTypes) GetTypeForPush(tp) {
+    pub fn eatPushArgs(self: *BytecodeInterpreter, comptime tp: BytecodeOp.PushTypes.Tp) GetTypeForPush(tp) {
         return self.eatType(GetTypeForPush(tp));
     }
     pub fn eatType(self: *BytecodeInterpreter, comptime T: type) T {
@@ -287,35 +294,117 @@ pub const BytecodeInterpreter = struct {
         self.valueStack.append(self.stackAllocator, item) catch @panic("whut whoa");
     }
 
+    pub fn analyzeFrame(self: *BytecodeInterpreter, keyref: u32, tp: SaveTypes) f32 {
+        for (self.store.cache.map.get(tp).?.items) |item| {
+            const leftFrameMatches = item.leftFrame.eql(self.store.leftFrame);
+            const rightFrameMatches = item.rightFrame.eql(self.store.rightFrame);
+            const isKeyref = item.derivedFrom.isKeyref;
+            const correctKeyref = item.derivedFrom.rest.keyref == keyref;
+
+            const frameMatches = leftFrameMatches and rightFrameMatches;
+            const keyrefGood = isKeyref and correctKeyref;
+            if (frameMatches and keyrefGood) {
+                return item.value;
+            }
+        }
+
+        const frame: *const Frame = &self.store.frames[keyref];
+
+        const forcedLeft = frame.skip;
+        const forcedRight = frame.skip + frame.values.len;
+        const leftBound = @max(self.store.leftFrame.orElse(0), forcedLeft);
+        const rightBound = @min(
+            self.store.rightFrame.orElse(self.store.maxFrame),
+            forcedRight,
+        );
+
+        const arrPtr = self.store.cache.map.getPtr(tp).?;
+        if (leftBound >= rightBound) {
+            const save: SavedValue = .{
+                .derivedFrom = .{
+                    .isKeyref = true,
+                    .rest = .{
+                        .keyref = @intCast(keyref),
+                    },
+                },
+                .leftFrame = self.store.leftFrame,
+                .rightFrame = self.store.rightFrame,
+                .value = std.math.nan(f32),
+            };
+            arrPtr.append(self.datastoreAllocator, save) catch {};
+            return std.math.nan(f32);
+        }
+
+        const value = switch (tp) {
+            .first => frame.values[leftBound],
+            .last => frame.values[rightBound - 1],
+            .min => blk: {
+                var val: f32 = frame.values[leftBound];
+                for (leftBound..rightBound) |frameno| {
+                    val = @min(frame.values[frameno], val);
+                }
+                break :blk val;
+            },
+            .max => blk: {
+                var val: f32 = frame.values[leftBound];
+                for (leftBound..rightBound) |frameno| {
+                    val = @max(frame.values[frameno], val);
+                }
+                break :blk val;
+            },
+            .mean => blk: {
+                var val: f32 = 0.0;
+                for (leftBound..rightBound) |frameno| {
+                    val += frame.values[frameno];
+                }
+                val /= @floatFromInt(rightBound - leftBound);
+                break :blk val;
+            },
+        };
+        const save: SavedValue = .{
+            .derivedFrom = .{
+                .isKeyref = true,
+                .rest = .{
+                    .keyref = @intCast(keyref),
+                },
+            },
+            .leftFrame = self.store.leftFrame,
+            .rightFrame = self.store.rightFrame,
+            .value = value,
+        };
+        arrPtr.append(self.datastoreAllocator, save) catch {};
+        return value;
+    }
+
     pub fn execOne(self: *BytecodeInterpreter, frameNo: u32, argBase: u32) void {
         const op = self.eatOp();
 
         if (op.isKeyref) {
-            switch (op.rest.keyref) {
+            const KeyrefArg = BytecodeOp.PushTypes.KeyrefArg;
+            const FnArg = BytecodeOp.PushTypes.FnArg;
+            switch (op.rest.keyref.tp) {
                 else => unreachable,
-                .keyref_get => {
-                    const v = self.eatPushArgs(.keyref_get);
-                    self.pushValue(
-                        self.store.frames[v.keyrefId].valueAtFrame(frameNo),
-                    );
+                .keyref => {
+                    const v: KeyrefArg = self.eatPushArgs(.keyref);
+                    if (op.rest.keyref.rest.keyref == .current) {
+                        self.pushValue(
+                            self.store.frames[v.keyrefId].valueAtFrame(frameNo),
+                        );
+                    } else if (op.rest.keyref.rest.keyref == .prev) {
+                        self.pushValue(
+                            self.store.frames[v.keyrefId].valueAtFrame(frameNo - 1),
+                        );
+                    } else {
+                        const value = self.analyzeFrame(v.keyrefId, op.rest.keyref.rest.keyref.toSaveType());
+                        self.pushValue(value);
+                    }
                 },
                 .value => {
                     const v = self.eatPushArgs(.value);
                     self.pushValue(v);
                 },
-                .keyref_first => {
-                    const v = self.eatPushArgs(.value);
-                    _ = v;
-                    const value = for (self.store.cache.map.get(.first).?.items) |item| {
-                        // TODO: derivedFrom check
-                        if (item.leftFrame.eql(self.store.leftFrame) and item.rightFrame.eql(self.store.rightFrame)) {
-                            break item.value;
-                        }
-                    } else 0.0;
-                    self.pushValue(value);
-                },
                 .fn_arg => {
-                    const argId: BytecodeOp.PushTypes.FnArg = self.eatPushArgs(.fn_arg);
+                    const argId: FnArg = self.eatPushArgs(.fn_arg);
                     // help:
                     // argId is 0, argBase is 0 (no items in stack)
                     // argId is 0, argBase is 1 (1 item in stack) (valid)
@@ -408,40 +497,20 @@ pub const BytecodeInterpreter = struct {
             lastPos = self.pos;
 
             if (op.isKeyref) {
-                switch (op.rest.keyref) {
-                    .keyref_get,
-                    .value,
-                    .keyref_first,
-                    .axis_first,
-                    .keyref_last,
-                    .axis_last,
-                    .keyref_min,
-                    .axis_min,
-                    .keyref_max,
-                    .axis_max,
-                    .keyref_mean,
-                    .axis_mean,
-                    .keyref_prev,
-                    .axis_selection,
-                    .keyref_selection,
-                    .fn_arg,
-                    => {
-                        current += 1;
-                        max = @max(current, max);
-                        self.pos += getTypeSizeForPush(op.rest.keyref);
-                    },
-                }
+                current += 1;
+                max = @max(current, max);
+                self.pos += getTypeSizeForPush(op.rest.keyref.tp);
             } else {
                 switch (op.rest.operation) {
                     // no change
-                    .negate, .ln, .exp, .sqrt, .abs => {},
+                    .negate, .sp_ln, .sp_exp, .sp_sqrt, .sp_abs => {},
                     .plus,
                     .minus,
                     .times,
                     .div,
-                    .max,
-                    .min,
-                    .pow,
+                    .sp_max,
+                    .sp_min,
+                    .sp_pow,
                     .gte,
                     .gt,
                     .lte,
@@ -465,6 +534,7 @@ pub const BytecodeInterpreter = struct {
     }
 };
 
+/// A thin wrapper to make building bytecode streams slightly easier
 pub const BytecodeBuilder = struct {
     arr: std.ArrayList(u8),
 

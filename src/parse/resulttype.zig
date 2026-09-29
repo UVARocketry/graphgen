@@ -2,7 +2,6 @@ const std = @import("std");
 const second = @import("../passes/second.zig");
 const Allocator = std.mem.Allocator;
 pub const SpecialTypes = enum {
-    handle,
     bytecode,
 };
 
@@ -21,12 +20,14 @@ pub fn Bytecode(keyrefs: bool, axisrefs: bool) type {
     };
 }
 
-pub fn HandleTo(things: []const []const u8) type {
-    return struct {
-        pub const special: SpecialTypes = .handle;
-        pub const handleTo = things;
-    };
-}
+// pub fn ValueOf(things: []const []const []const u8, T: type) type {
+//     return struct {
+//         pub const special: SpecialTypes = .handle;
+//         pub const handleTo = things;
+//         activeHandle: u32,
+//         ptr: T,
+//     };
+// }
 
 pub const Graph = struct {
     pub const Filter = struct {
@@ -47,8 +48,13 @@ pub const Graph = struct {
     };
 
     pub const Annotation = struct {
-        line: HandleTo(&.{"y"}),
-        select: enum { max, min, first, last },
+        line: Bytecode(true, false),
+        select: enum {
+            max,
+            min,
+            first,
+            last,
+        },
         x: Bytecode(true, true),
         y: Bytecode(true, true),
         text: []const u8,

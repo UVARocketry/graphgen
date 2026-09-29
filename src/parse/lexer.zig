@@ -20,9 +20,12 @@ pub const TokenType = enum {
 
     op_eq,
 
-    hash,
+    valuerefdecl,
+    nakedvalueref,
 
     colon,
+
+    comma,
 
     at,
 
@@ -35,8 +38,105 @@ pub const TokenType = enum {
     op_gte,
     op_lte,
 
+    newline,
+
     eof,
+
+    pub fn isEos(self: TokenType) bool {
+        return self == .eof or self == .newline;
+    }
+
+    pub fn isOp(self: TokenType) bool {
+        const tag = @tagName(self);
+        if (std.mem.startsWith(u8, tag, "op_")) return true;
+        return false;
+    }
+
+    pub fn isKwd(self: TokenType) bool {
+        const tag = @tagName(self);
+        if (std.mem.startsWith(u8, tag, "kwd_")) return true;
+        return false;
+    }
+
+    pub fn toOperator(self: TokenType) Operator {
+        return switch (self) {
+            .op_times => .times,
+            .op_div => .div,
+            .op_plus => .plus,
+            .op_minus => .minus,
+            .op_gt => .gt,
+            .op_lt => .lt,
+            .op_gte => .gte,
+            .op_lte => .lte,
+        };
+    }
 };
+
+pub const Operator = enum {
+    pub const Associativity = enum {
+        left_to_right,
+        right_to_left,
+    };
+    times,
+    div,
+    plus,
+    minus,
+    gt,
+    lt,
+    gte,
+    lte,
+
+    pub fn associativity(op: Operator) Associativity {
+        // just yoinked c's operator precedence
+        // https://en.cppreference.com/c/language/operator_precedence
+        return switch (op) {
+            .times, .div, .plus, .minus, .gt, .lt, .gte, .lte => .left_to_right,
+        };
+    }
+    pub fn precedenceMax() u32 {
+        return 6;
+    }
+    pub fn precedence(op: Operator) u32 {
+        // just yoinked c's operator precedence
+        // https://en.cppreference.com/c/language/operator_precedence
+        return switch (op) {
+            .times, .div => 3,
+            .plus, .minus => 4,
+            .gt, .lt, .gte, .lte => 5,
+        };
+    }
+};
+
+comptime {
+    for (std.meta.fieldNames(Operator)) |field| {
+        std.debug.assert(std.meta.fieldIndex(TokenType, "op_" ++ field) != null);
+    }
+    for (std.meta.fieldNames(TokenType)) |field| {
+        if (std.mem.eql(u8, field, "op_eq")) {
+            continue;
+        }
+        if (std.mem.startsWith(u8, field, "op_")) {
+            std.debug.assert(std.meta.fieldIndex(Operator, field[3..]) != null);
+        }
+    }
+}
+
+pub const FullToken = struct {
+    tp: TokenType,
+    currentString: ?[]const u8 = null,
+    currentTokenString: []const u8 = "",
+    currentNumber: ?f32 = null,
+};
+
+const Mark = struct {
+    index: u32,
+};
+
+pub const LexerError = error{
+    ExtraFloatingPointDot,
+    UnexpectedAlphaCharacter,
+    UnknownCharacter,
+} || std.Io.Writer.Error || std.mem.Allocator.Error || std.fmt.ParseFloatError;
 
 pub const Lexer = struct {
     currentString: ?[]const u8 = null,
@@ -54,8 +154,43 @@ pub const Lexer = struct {
         };
     }
 
-    pub fn peekNextToken(self: *Lexer) !TokenType {
-        return try self.getNextToken(null);
+    pub fn mark(self: *const Lexer) Mark {
+        return .{
+            .index = self.index,
+        };
+    }
+    pub fn stringFromMarks(self: *const Lexer, mark1: Mark, mark2: Mark) []const u8 {
+        return self.file[mark1.index..mark2.index];
+    }
+
+    pub fn reset(self: *Lexer) void {
+        self.index = 0;
+        self.currentString = null;
+        self.currentNumber = null;
+        self.currentTokenString = "";
+    }
+
+    pub fn peekNextToken(self: *Lexer, diagnostic: *files.Diagnostic) LexerError!FullToken {
+        const pos = self.index;
+        defer self.index = pos;
+        const str = self.currentString;
+        defer self.currentString = str;
+        const num = self.currentNumber;
+        defer self.currentNumber = num;
+        const tokStr = self.currentTokenString;
+        defer self.currentTokenString = tokStr;
+
+        const tp = try self.getNextToken(diagnostic);
+        const realStr = self.currentString;
+        const realNum = self.currentNumber;
+        const realTokStr = self.currentTokenString;
+
+        return .{
+            .tp = tp,
+            .currentTokenString = realTokStr,
+            .currentNumber = realNum,
+            .currentString = realStr,
+        };
     }
 
     fn peekChar(self: *Lexer) u8 {
@@ -97,7 +232,7 @@ pub const Lexer = struct {
         }
         return false;
     }
-    fn eatNumber(self: *Lexer, diagnostic: ?*files.Diagnostic) !TokenType {
+    fn eatNumber(self: *Lexer, diagnostic: *files.Diagnostic) LexerError!TokenType {
         const start = self.index;
 
         var hasDot = false;
@@ -112,54 +247,48 @@ pub const Lexer = struct {
             const ch = self.eatChar();
             if (ch == '.') {
                 if (hasDot) {
-                    if (diagnostic) |d| {
-                        var w = d.writer();
-                        defer w.deinit();
+                    var w = diagnostic.writer();
+                    defer w.deinit();
 
-                        try w.writer.print(
-                            "Lexer error: Excess dot in floating point value!",
-                            .{},
-                        );
-                        const word = self.file[start..self.index];
-                        d.message = try w.toOwnedSlice();
-                        d.from = .from(word);
-                        return error.ExtraFloatingPointDot;
-                    }
+                    try w.writer.print(
+                        "Lexer error: Excess dot in floating point value!",
+                        .{},
+                    );
+                    const word = self.file[start..self.index];
+                    diagnostic.message = try w.toOwnedSlice();
+                    diagnostic.from = .from(word);
+                    return error.ExtraFloatingPointDot;
                 }
                 hasDot = true;
             }
         }
 
         if (Lexer.isAlpha(self.peekChar())) {
-            if (diagnostic) |d| {
-                var w = d.writer();
-                defer w.deinit();
+            var w = diagnostic.writer();
+            defer w.deinit();
 
-                try w.writer.print(
-                    "Lexer error: Unexpected alphabetic character after floating point literal, this means you prolly made a mistake!",
-                    .{},
-                );
-                const word = self.file[self.index .. self.index + 1];
-                d.message = try w.toOwnedSlice();
-                d.from = .from(word);
-                return error.UnexpectedAlphaCharacter;
-            }
+            try w.writer.print(
+                "Lexer error: Unexpected alphabetic character after floating point literal, this means you prolly made a mistake!",
+                .{},
+            );
+            const word = self.file[self.index .. self.index + 1];
+            diagnostic.message = try w.toOwnedSlice();
+            diagnostic.from = .from(word);
+            return error.UnexpectedAlphaCharacter;
         }
 
         const word = self.file[start..self.index];
 
         self.currentNumber = std.fmt.parseFloat(f32, word) catch |e| {
-            if (diagnostic) |d| {
-                var w = d.writer();
-                defer w.deinit();
+            var w = diagnostic.writer();
+            defer w.deinit();
 
-                try w.writer.print(
-                    "Lexer error: Could not parse floating point value, got error {t}!",
-                    .{e},
-                );
-                d.message = try w.toOwnedSlice();
-                d.from = .from(word);
-            }
+            try w.writer.print(
+                "Lexer error: Could not parse floating point value, got error {t}!",
+                .{e},
+            );
+            diagnostic.message = try w.toOwnedSlice();
+            diagnostic.from = .from(word);
             return e;
         };
 
@@ -228,7 +357,7 @@ pub const Lexer = struct {
         return .keyref;
     }
 
-    pub fn getNextToken(self: *Lexer, diagnostic: ?*files.Diagnostic) !TokenType {
+    pub fn getNextToken(self: *Lexer, diagnostic: *files.Diagnostic) LexerError!TokenType {
         const char = self.peekChar();
         self.currentNumber = null;
         self.currentString = null;
@@ -240,7 +369,13 @@ pub const Lexer = struct {
             while (self.peekChar() != '\n' and self.peekChar() != 0) {
                 _ = self.eatChar();
             }
-            return self.getNextToken(diagnostic);
+            return .newline;
+        }
+        if (char == '\n') {
+            const start = self.index;
+            defer self.currentTokenString = self.file[start..self.index];
+            _ = self.eatChar();
+            return .newline;
         }
         // space chars
         if (char <= 32) {
@@ -269,9 +404,55 @@ pub const Lexer = struct {
         } else if (char == ')') {
             _ = self.eatChar();
             return .rparen;
+        } else if (char == ',') {
+            _ = self.eatChar();
+            return .comma;
+        } else if (char == '!') {
+            _ = self.eatChar();
+            const next = self.eatChar();
+            if (next != '#') {
+                var w = diagnostic.writer();
+                defer w.deinit();
+
+                try w.writer.print(
+                    "Lexer error: Expected a '#' after an '!' to create a naked value reference (eg !#value_name), but instead got'{c}'!",
+                    .{self.peekChar()},
+                );
+                diagnostic.message = try w.toOwnedSlice();
+                diagnostic.from = .from(self.file[self.index .. self.index + 1]);
+            }
+            const realStart = self.index;
+            if (!Lexer.isAlpha(self.peekChar())) {
+                var w = diagnostic.writer();
+                defer w.deinit();
+
+                try w.writer.print(
+                    "Lexer error: Expected an alphabetic character after a hash, instead got '{c}'!",
+                    .{self.peekChar()},
+                );
+                diagnostic.message = try w.toOwnedSlice();
+                diagnostic.from = .from(self.file[self.index .. self.index + 1]);
+            }
+            _ = self.eatWord();
+            self.currentString = self.file[realStart..self.index];
+            return .nakedvalueref;
         } else if (char == '#') {
             _ = self.eatChar();
-            return .hash;
+            const realStart = self.index;
+            if (!Lexer.isAlpha(self.peekChar())) {
+                var w = diagnostic.writer();
+                defer w.deinit();
+
+                try w.writer.print(
+                    "Lexer error: Expected an alphabetic character after a hash, instead got '{c}'!",
+                    .{self.peekChar()},
+                );
+                diagnostic.message = try w.toOwnedSlice();
+                diagnostic.from = .from(self.file[self.index .. self.index + 1]);
+            }
+            _ = self.eatWord();
+            self.currentString = self.file[realStart..self.index];
+            return .valuerefdecl;
         } else if (char == '"' or char == '\'') {
             return self.eatString();
         } else if (char == '@') {
@@ -314,20 +495,19 @@ pub const Lexer = struct {
         } else if (Lexer.isNum(char)) {
             return self.eatNumber(diagnostic);
         }
-        if (diagnostic) |d| {
-            var w = d.writer();
-            defer w.deinit();
+        var w = diagnostic.writer();
+        defer w.deinit();
 
-            try w.writer.print(
-                "Lexer error: Unknown character '{c}'!",
-                .{self.peekChar()},
-            );
-            d.message = try w.toOwnedSlice();
-            d.from = .from(self.file[self.index .. self.index + 1]);
-        }
+        try w.writer.print(
+            "Lexer error: Unknown character '{c}'!",
+            .{self.peekChar()},
+        );
+        diagnostic.message = try w.toOwnedSlice();
+        diagnostic.from = .from(self.file[self.index .. self.index + 1]);
+
         return error.UnknownCharacter;
     }
-    pub fn getNextTokenOptional(self: *Lexer, diagnostic: ?*files.Diagnostic) !?TokenType {
+    pub fn getNextTokenOptional(self: *Lexer, diagnostic: *files.Diagnostic) LexerError!?TokenType {
         const token = try self.getNextToken(diagnostic);
         if (token == .eof) {
             return null;
