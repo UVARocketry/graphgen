@@ -1,4 +1,45 @@
 const std = @import("std");
+
+// bytecode format:
+//
+// |-- header --|-- payload --|
+// |     1b     |   n bytes   |
+// |------------|-------------|
+//
+// the idea is that there is a 1 byte operand and then between 0 and n bytes of payload
+//
+// operand format (in order of lsb to msb):
+//
+// - bit 1: set to 1 if it is a push operation (eg add a value to the stack), set to 0
+//   for operations that pop off the stack and then push results onto the stack
+// - next 7 bits are different depending on bit 1
+//
+// if bit 1 is 0, the next 7 are an enum that determines what the operation is, for
+// example, the "plus" operation POPs two values off the stack then PUSHes their sum
+//
+// if bit 1 is 1, we have to go down a few more turtles:
+//  next two bits are specify the push type: keyref, axis, value, fn_arg
+//  - if keyref or axis, the next 5 bits specify how to access that variable:
+//      - first, last, min, max, mean, current, prev, etc
+//          - eg .keyref .first could mean something like .timestamp_s:first
+//  - for .value and .fn_arg, the next 5 bits are undefined
+//
+// All PUSH operations have a payload. The size and type of that payload is entirely
+// determined by the push type enum:
+//  - .keyref PUSH is followed by an 8 bit keyref id (an index into the keyref table
+//      given by parse_txt.zig:parseDbgFile)
+//  - .axis PUSH is followed by a 32 bit bytecode ref (16 bits of the starting index
+//      in the bytecode array and 16 bits for the length). the idea with this is that
+//      we can have an axis and then create annotations based on that axis by just
+//      executing the axis's bytecode to determine location and value of annotations
+//  - .value PUSH is followed by a 32 bit float
+//  - .fn_arg PUSH is followed by an 8 bit arg index, arg indices are reverse indexed
+//      (so 0 means the last argument)
+//
+// the only non-PUSH operation to have a payload is .call:
+//  - the payload is a 32 bit BytecodeRef (as described earlier) that refers to the
+//      contents of the function, along with 16 bits for the number of args passed
+
 // debug info? alongside the byte stream?
 
 // callconv:

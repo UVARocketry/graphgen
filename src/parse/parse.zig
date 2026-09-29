@@ -5,6 +5,15 @@ const files = @import("../fileref.zig");
 const Diagnostic = files.Diagnostic;
 const Allocator = std.mem.Allocator;
 
+// two passes:
+//
+// first pass emits partial bytecode (so for function calls and bytecode refs and axis
+// refs and value refs, we put in a placeholder bytecode), it also makes note of all
+// available functions, their actual bytecode values, all available refs etc
+//
+// second pass goes over, emits the real type, also finalizes the emitted bytecode
+// earlier
+
 // TODO: uhhh lowkey dont think we need to even emit an ast, we can just emit bytecode
 
 /// this only applies to components *of expressions*

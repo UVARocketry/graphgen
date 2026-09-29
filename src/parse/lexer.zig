@@ -1,6 +1,12 @@
 const std = @import("std");
 const files = @import("../fileref.zig");
 
+// pretty basic lexer in this file tbh. there are a few simplifying assumptions
+// (at least for now):
+//
+// - no multiline strings
+// - no special characters in strings
+
 pub const TokenType = enum {
     string,
     ident,
