@@ -42,7 +42,10 @@ pub const LineParts = struct {
 
         const pre = fileContents[startIndex..refStartIndex];
         const middle = ref.str;
-        const end = fileContents[refStartIndex + ref.str.len .. endIndex];
+        const end = if (refStartIndex + ref.str.len >= fileContents.len or endIndex > fileContents.len or refStartIndex + ref.str.len > endIndex)
+            ""
+        else
+            fileContents[refStartIndex + ref.str.len .. endIndex];
         return .{
             .before = pre,
             .err = middle,

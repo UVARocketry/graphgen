@@ -68,6 +68,7 @@ pub const TokenType = enum {
             .op_lt => .lt,
             .op_gte => .gte,
             .op_lte => .lte,
+            else => unreachable,
         };
     }
 };

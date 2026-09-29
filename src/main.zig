@@ -123,6 +123,10 @@ pub fn doParse(
         .lexer = lexer,
     };
 
+    defer parser.bytecodeStream.arr.deinit(gpa);
+    defer parser.keyrefTable.deinit(gpa);
+    defer parser.scope.deinit(gpa);
+
     try parser.pass(gpa, &diagnostic);
 
     _ = try stdout.write("");

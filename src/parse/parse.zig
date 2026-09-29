@@ -44,17 +44,48 @@ pub const AstType = enum {
 // available functions, their actual bytecode values, all available refs etc
 //
 // second pass goes over, emits the real type, also emits bytecode
+
+// TODO: functions need a list of their parameter count, they also should have a list
+// of parameter names so that we can give a nice error ("not enough params, you need
+// {this} parameter").
+// Also, i think we can do the cross file diagnostics without chaning FileRef at all
+// bc we can just have the diagnostic engine search for which file a ptr is in and
+// then do that (gg ez)
+// Also, we need some way for local parsing to work while still emitting
+// the global binary correctly hmmmm (this includes importing, eg
+// `import "std" as std` should yield std.function() in one file
+// but if another file has `import "std" as a`, it should yield
+// a.function() and everything should work (maybe each function that's created has
+// a rename list where each file gets a different rename)
 pub const ScopeItem = struct {
-    name: []const u8,
-    tp: enum {
+    pub const Type = enum {
         function,
         valueref,
-    },
+
+        pub fn nameFor(tp: Type) []const u8 {
+            return switch (tp) {
+                .function => "function",
+                .valueref => "value reference",
+            };
+        }
+    };
+
+    name: []const u8,
+    tp: Type,
+    /// where this thing was defined, null if it was only forward referenced
+    /// (eg a call to a function that is defined further down the file)
+    def: ?files.FileRef = null,
 };
 
 pub const Pass1Error = error{
+    Undefined,
+    UnknownAccessType,
+    ExcessArguments,
+    TooFewArguments,
+    MissingParenthese,
     MissingEndOfStatement,
     KeywordAsIdentifier,
+    AlreadyDefined,
     UnexpectedToken,
 } || lex.LexerError;
 
@@ -64,21 +95,73 @@ pub const ParserPass1 = struct {
     scope: std.ArrayList(ScopeItem),
     keyrefTable: std.ArrayList([]const u8),
     const Parser = ParserPass1;
-    var stackSize: u32 = 0;
 
-    fn dbgstack(self: *const Parser) void {
-        _ = self;
-        for (0..stackSize) |_| {
-            std.debug.print("  ", .{});
-        }
+    pub fn findScopeItem(self: *const Parser, name: []const u8, tp: ScopeItem.Type) ?usize {
+        const found: ?usize = for (self.scope.items, 0..) |item, i| {
+            if (item.tp != tp) continue;
+            if (std.mem.eql(u8, item.name, name)) break i;
+        } else null;
+        return found;
     }
+
+    /// gets the index of an item in the scope table, creating a forward
+    /// reference placeholder if it doesnt exist yet
+    pub fn referenceScopeItem(
+        self: *Parser,
+        alloc: Allocator,
+        name: []const u8,
+        tp: ScopeItem.Type,
+    ) !u16 {
+        if (self.findScopeItem(name, tp)) |i| {
+            return @intCast(i);
+        }
+        try self.scope.append(alloc, .{
+            .name = name,
+            .tp = tp,
+        });
+        return @intCast(self.scope.items.len - 1);
+    }
+
+    /// adds a definition to the scope table, erroring if the same thing was
+    /// already defined before. returns the index of the definition
+    pub fn defineScopeItem(
+        self: *Parser,
+        alloc: Allocator,
+        name: []const u8,
+        tp: ScopeItem.Type,
+        def: files.FileRef,
+        diagnostic: *Diagnostic,
+    ) Pass1Error!u16 {
+        if (self.findScopeItem(name, tp)) |i| {
+            if (self.scope.items[i].def) |firstDef| {
+                var w = diagnostic.writer();
+                defer w.deinit();
+                try w.writer.print(
+                    \\parse error: {s} '{s}' has already been defined!
+                ,
+                    .{ tp.nameFor(), name },
+                );
+                diagnostic.message = try w.toOwnedSlice();
+                diagnostic.from = def;
+                try diagnostic.addRef(.{
+                    .staticMessage = "first definition:",
+                    .ref = firstDef,
+                });
+                return error.AlreadyDefined;
+            }
+            // it was forward referenced, so this definition just fills it in
+            self.scope.items[i].def = def;
+            return @intCast(i);
+        }
+        try self.scope.append(alloc, .{
+            .name = name,
+            .tp = tp,
+            .def = def,
+        });
+        return @intCast(self.scope.items.len - 1);
+    }
+
     pub fn parseObject(self: *Parser, alloc: Allocator, diagnostic: *Diagnostic) Pass1Error!void {
-        stackSize += 1;
-        defer stackSize -= 1;
-
-        self.dbgstack();
-        std.debug.print("OBJ\n", .{});
-
         var currentToken = try self.lexer.getNextToken(diagnostic);
         while (currentToken != .eof) {
             switch (currentToken) {
@@ -87,6 +170,7 @@ pub const ParserPass1 = struct {
                 },
                 .newline => {
                     currentToken = try self.lexer.getNextToken(diagnostic);
+                    continue;
                 },
                 .rbrace => return,
                 else => {
@@ -136,9 +220,7 @@ pub const ParserPass1 = struct {
         }
     }
 
-    pub fn getAccessType(self: *Parser, diagnostic: *Diagnostic) Pass1Error!bc.PushTypes2.AccessType {
-        stackSize += 1;
-        defer stackSize -= 1;
+    pub fn getAccessType(self: *Parser, diagnostic: *Diagnostic) Pass1Error!bc.BytecodeOp.PushTypes.AccessType {
         const currentTokenStr = self.lexer.currentTokenString;
         const next = try self.lexer.peekNextToken(diagnostic);
         if (next.tp != .colon) {
@@ -162,7 +244,7 @@ pub const ParserPass1 = struct {
             );
             diagnostic.message = try w.toOwnedSlice();
             diagnostic.from = .from(self.lexer.currentTokenString);
-            diagnostic.addRef(.{
+            try diagnostic.addRef(.{
                 .staticMessage = "while parsing reference",
                 .ref = .from(currentTokenStr),
             });
@@ -178,15 +260,15 @@ pub const ParserPass1 = struct {
             );
             diagnostic.message = try w.toOwnedSlice();
             diagnostic.from = .from(self.lexer.currentTokenString);
-            diagnostic.addRef(.{
+            try diagnostic.addRef(.{
                 .staticMessage = "while parsing reference",
                 .ref = .from(currentTokenStr),
             });
             return error.UnexpectedToken;
         }
 
-        const A = bc.PushTypes2.AccessType;
-        const value: A = for (@typeInfo(A).@"enum".fields) |field| {
+        const A = bc.BytecodeOp.PushTypes.AccessType;
+        const value: A = inline for (@typeInfo(A).@"enum".fields) |field| {
             if (std.mem.eql(u8, field.name, self.lexer.currentTokenString)) {
                 break @enumFromInt(field.value);
             }
@@ -200,12 +282,12 @@ pub const ParserPass1 = struct {
             );
             const fields = @typeInfo(A).@"enum".fields;
             try w.writer.print("'{s}'", .{fields[0].name});
-            for (fields[1..]) |field| {
+            inline for (fields[1..]) |field| {
                 try w.writer.print(", '{s}'", .{field.name});
             }
             diagnostic.message = try w.toOwnedSlice();
             diagnostic.from = .from(self.lexer.currentTokenString);
-            diagnostic.addRef(.{
+            try diagnostic.addRef(.{
                 .staticMessage = "while parsing reference",
                 .ref = .from(currentTokenStr),
             });
@@ -216,20 +298,9 @@ pub const ParserPass1 = struct {
     }
 
     pub fn emitValueref(self: *Parser, alloc: Allocator, diagnostic: *Diagnostic) Pass1Error!void {
-        stackSize += 1;
-        defer stackSize -= 1;
-        const valueRefname = self.lexer.currentString;
+        const valueRefname = self.lexer.currentString.?;
 
-        const scopeIndex = for (self.scope.items, 0..) |item, i| {
-            if (item.tp != .valueref) continue;
-            if (std.mem.eql(u8, item.name, valueRefname)) break i;
-        } else blk: {
-            try self.scope.append(alloc, .{
-                .name = valueRefname,
-                .tp = .valueref,
-            });
-            break :blk self.scope.items.len - 1;
-        };
+        const scopeIndex = try self.referenceScopeItem(alloc, valueRefname, .valueref);
 
         const access = try self.getAccessType(diagnostic);
 
@@ -243,26 +314,15 @@ pub const ParserPass1 = struct {
             },
         });
         try self.bytecodeStream.addType(bc.BytecodeOp.PushTypes.AxisArg, alloc, .{
-            .start = @intCast(scopeIndex),
+            .start = scopeIndex,
             .len = 0,
         });
     }
 
     pub fn emitFunctionCall(self: *Parser, alloc: Allocator, diagnostic: *Diagnostic) Pass1Error!void {
-        stackSize += 1;
-        defer stackSize -= 1;
         const fnName = self.lexer.currentTokenString;
 
-        const scopeIndex = for (self.scope.items, 0..) |item, i| {
-            if (item.tp != .function) continue;
-            if (std.mem.eql(u8, item.name, fnName)) break i;
-        } else blk: {
-            try self.scope.append(alloc, .{
-                .name = fnName,
-                .tp = .function,
-            });
-            break :blk self.scope.items.len - 1;
-        };
+        const scopeIndex = try self.referenceScopeItem(alloc, fnName, .function);
 
         const lparen = try self.lexer.getNextToken(diagnostic);
 
@@ -281,11 +341,12 @@ pub const ParserPass1 = struct {
 
         var argsCount: u16 = 0;
 
-        const specialOp: bc.BytecodeOp.OpTypes =
-            inline for (std.meta.fieldNames(bc.BytecodeOp.OpTypes)) |field| {
-                if (std.mem.startsWith(u8, field, "sp_")) {
-                    if (std.mem.eql(u8, "sp_" + fnName, field)) {
-                        const op = @field(bc.BytecodeOp.OpTypes, field);
+        const specialOp: ?bc.BytecodeOp.OpTypes =
+            inline for (std.meta.fields(bc.BytecodeOp.OpTypes)) |field| {
+                if (std.mem.startsWith(u8, field.name, "sp_")) {
+                    const start = if (field.name.len < 3) field.name.len else 3;
+                    if (std.mem.eql(u8, fnName, field.name[start..])) {
+                        const op: bc.BytecodeOp.OpTypes = @enumFromInt(field.value);
                         break op;
                     }
                 }
@@ -334,7 +395,7 @@ pub const ParserPass1 = struct {
                 break;
             }
             if (next.tp == .comma) {
-                try self.lexer.getNextToken(diagnostic);
+                _ = try self.lexer.getNextToken(diagnostic);
                 continue;
             }
             if (next.tp.isEos()) {
@@ -395,7 +456,7 @@ pub const ParserPass1 = struct {
         });
         try self.bytecodeStream.addType(bc.BytecodeOp.OpTypes.FnCallArgs, alloc, .{
             .bytecode = .{
-                .start = @intCast(scopeIndex),
+                .start = scopeIndex,
                 .len = 0,
             },
             .argsPassed = argsCount,
@@ -403,11 +464,9 @@ pub const ParserPass1 = struct {
     }
 
     pub fn emitKeyref(self: *Parser, alloc: Allocator, diagnostic: *Diagnostic) Pass1Error!void {
-        stackSize += 1;
-        defer stackSize -= 1;
         const keyrefName = self.lexer.currentTokenString;
 
-        const keyrefIndex = for (self.keyrefTable, 0..) |name, i| {
+        const keyrefIndex = for (self.keyrefTable.items, 0..) |name, i| {
             if (std.mem.eql(u8, name, keyrefName)) break i;
         } else blk: {
             try self.keyrefTable.append(alloc, keyrefName);
@@ -426,7 +485,7 @@ pub const ParserPass1 = struct {
             },
         });
         try self.bytecodeStream.addType(bc.BytecodeOp.PushTypes.KeyrefArg, alloc, .{
-            .keyrefId = keyrefIndex,
+            .keyrefId = @intCast(keyrefIndex),
         });
     }
 
@@ -438,8 +497,6 @@ pub const ParserPass1 = struct {
         inFunction: bool,
         diagnostic: *Diagnostic,
     ) Pass1Error!void {
-        stackSize += 1;
-        defer stackSize -= 1;
         const token = try self.lexer.getNextToken(diagnostic);
 
         switch (token) {
@@ -516,15 +573,16 @@ pub const ParserPass1 = struct {
                 );
                 diagnostic.message = try w.toOwnedSlice();
                 diagnostic.from = .from(opTok.currentTokenString);
-                diagnostic.addRef(.{
+                try diagnostic.addRef(.{
                     .staticMessage = "after parsing expression component",
                     .ref = .from(self.lexer.currentTokenString),
                 });
+                return error.UnexpectedToken;
             }
 
             const op = opTok.tp.toOperator();
 
-            const add = switch (op.associativity()) {
+            const add: u32 = switch (op.associativity()) {
                 .left_to_right => 1,
                 .right_to_left => 0,
             };
@@ -572,41 +630,64 @@ pub const ParserPass1 = struct {
     }
 
     pub fn parseValue(self: *Parser, alloc: Allocator, diagnostic: *Diagnostic) Pass1Error!void {
-        stackSize += 1;
-        defer stackSize -= 1;
-
-        self.dbgstack();
-        std.debug.print("VALUE\n", .{});
-
         const identName = self.lexer.currentTokenString;
 
         const maybeValueRef = try self.lexer.peekNextToken(diagnostic);
         if (maybeValueRef.tp == .valuerefdecl) {
             _ = try self.lexer.getNextToken(diagnostic);
-            try self.scope.append(alloc, .{
-                .name = self.lexer.currentString.?,
-                .tp = .valueref,
-            });
+            _ = try self.defineScopeItem(
+                alloc,
+                self.lexer.currentString.?,
+                .valueref,
+                .from(self.lexer.currentTokenString),
+                diagnostic,
+            );
         }
 
         const token = try self.lexer.getNextToken(diagnostic);
         switch (token) {
             .string => {},
+            .op_minus => {
+                const minusStr = self.lexer.currentTokenString;
+                const num = try self.lexer.getNextToken(diagnostic);
+                if (num != .number) {
+                    var w = diagnostic.writer();
+                    defer w.deinit();
+
+                    try w.writer.print(
+                        "parse error: Unexpected token '{s}'. Expected a number after a '-' (eg -0.8)",
+                        .{
+                            self.lexer.currentTokenString,
+                        },
+                    );
+                    diagnostic.message = try w.toOwnedSlice();
+                    diagnostic.from = .from(self.lexer.currentTokenString);
+                    try diagnostic.addRef(.{
+                        .staticMessage = "after",
+                        .ref = .from(minusStr),
+                    });
+                    return error.UnexpectedToken;
+                }
+            },
             .lbrace => {
                 try self.parseObject(alloc, diagnostic);
             },
+            .number => {},
             .ident => {},
             .nakedvalueref => {},
-            .equal => {},
+            .op_eq => {
+                try self.parseBytecode(alloc, diagnostic);
+            },
             else => {
                 if (maybeValueRef.tp == .valuerefdecl) {
                     var w = diagnostic.writer();
                     defer w.deinit();
 
                     try w.writer.print(
-                        "parse error: Unexpected token '{s}'. Expected a string, left bracket (to start an object definition), identifier (for an enum value), a value reference ('!#name'), or an equals sign (to start an interpreted statement).",
+                        "parse error: Unexpected token '{s}'. Expected a string, left bracket (to start an object definition), identifier (for an enum value), a value reference ('!#name'), or an equals sign (to start an interpreted statement). ({t})",
                         .{
                             self.lexer.currentTokenString,
+                            token,
                         },
                     );
                     diagnostic.message = try w.toOwnedSlice();
@@ -621,9 +702,10 @@ pub const ParserPass1 = struct {
                     defer w.deinit();
 
                     try w.writer.print(
-                        "parse error: Unexpected token '{s}'. Expected a string, left bracket (to start an object definition), identifier (for an enum value), a value reference ('!#name'), an equals sign (to start an interpreted statement), or a value reference declaration ('#name') followed by one of the other listed tokens.",
+                        "parse error: Unexpected token '{s}'. Expected a string, left bracket (to start an object definition), identifier (for an enum value), a value reference ('!#name'), an equals sign (to start an interpreted statement), or a value reference declaration ('#name') followed by one of the other listed tokens. ({t})",
                         .{
                             self.lexer.currentTokenString,
+                            token,
                         },
                     );
                     diagnostic.message = try w.toOwnedSlice();
@@ -660,17 +742,226 @@ pub const ParserPass1 = struct {
         }
     }
 
+    pub fn parseFn(self: *Parser, alloc: Allocator, diagnostic: *Diagnostic) Pass1Error!void {
+        const fnKeywordStr = self.lexer.currentTokenString;
+        const name = try self.lexer.getNextToken(diagnostic);
+
+        if (name != .ident) {
+            const isKwd = std.mem.startsWith(u8, @tagName(name), "kwd_");
+            var w = diagnostic.writer();
+            defer w.deinit();
+            if (isKwd) {
+                try w.writer.print(
+                    \\parse error: Expected an identifier for a function name, instead got the keyword '{s}'
+                    \\  NOTE: keywords cannot be used as identifiers
+                ,
+                    .{self.lexer.currentTokenString},
+                );
+            } else {
+                try w.writer.print(
+                    "parse error: Expected an identifier for a function name, instead got the token '{s}'",
+                    .{self.lexer.currentTokenString},
+                );
+            }
+            diagnostic.message = try w.toOwnedSlice();
+            diagnostic.from = .from(self.lexer.currentTokenString);
+            try diagnostic.addRef(.{
+                .staticMessage = "expected function, because of",
+                .ref = .from(fnKeywordStr),
+            });
+            if (isKwd) {
+                return error.KeywordAsIdentifier;
+            }
+            return error.UnexpectedToken;
+        }
+
+        const fnName = self.lexer.currentTokenString;
+
+        _ = try self.defineScopeItem(
+            alloc,
+            fnName,
+            .function,
+            .from(fnName),
+            diagnostic,
+        );
+
+        const lparen = try self.lexer.getNextToken(diagnostic);
+
+        if (lparen != .lparen) {
+            var w = diagnostic.writer();
+            defer w.deinit();
+            if (lparen.isEos()) {
+                try w.writer.print(
+                    \\parse error: Expected a '(' after function name '{s}', instead got a newline
+                    \\  NOTE: the name and its parameter list must be on the same line
+                ,
+                    .{fnName},
+                );
+            } else {
+                try w.writer.print(
+                    "parse error: Expected a '(' after function name '{s}', instead got '{s}'",
+                    .{ fnName, self.lexer.currentTokenString },
+                );
+            }
+            diagnostic.message = try w.toOwnedSlice();
+            diagnostic.from = .from(self.lexer.currentTokenString);
+            try diagnostic.addRef(.{
+                .staticMessage = "while parsing function definition for ",
+                .ref = .from(fnName),
+            });
+            return error.MissingParenthese;
+        }
+
+        var paramIndex: usize = 0;
+        while (true) {
+            const next = try self.lexer.peekNextToken(diagnostic);
+            if (next.tp == .rparen) {
+                break;
+            }
+
+            const param = try self.lexer.getNextToken(diagnostic);
+            if (param != .ident) {
+                const isKwd = std.mem.startsWith(u8, @tagName(param), "kwd_");
+                var w = diagnostic.writer();
+                defer w.deinit();
+                if (param.isEos()) {
+                    try w.writer.print(
+                        \\parse error: Expected an identifier for parameter {} of function '{s}', instead got a newline
+                        \\  NOTE: check that the parameter list of this function is closed with a ')'
+                    ,
+                        .{ paramIndex + 1, fnName },
+                    );
+                } else if (isKwd) {
+                    try w.writer.print(
+                        \\parse error: Expected an identifier for parameter {} of function '{s}', instead got the keyword '{s}'
+                        \\  NOTE: keywords cannot be used as identifiers
+                    ,
+                        .{ paramIndex + 1, fnName, self.lexer.currentTokenString },
+                    );
+                } else {
+                    try w.writer.print(
+                        "parse error: Expected an identifier for parameter {} of function '{s}', instead got the token '{s}'",
+                        .{ paramIndex + 1, fnName, self.lexer.currentTokenString },
+                    );
+                }
+                diagnostic.message = try w.toOwnedSlice();
+                diagnostic.from = .from(self.lexer.currentTokenString);
+                try diagnostic.addRef(.{
+                    .staticMessage = "while parsing parameter list of",
+                    .ref = .from(fnName),
+                });
+                if (isKwd) {
+                    return error.KeywordAsIdentifier;
+                }
+                if (param.isEos()) {
+                    return error.MissingParenthese;
+                }
+                return error.UnexpectedToken;
+            }
+            paramIndex += 1;
+
+            const commaMaybe = try self.lexer.peekNextToken(diagnostic);
+            if (commaMaybe.tp == .comma) {
+                _ = try self.lexer.getNextToken(diagnostic);
+                continue;
+            }
+            if (commaMaybe.tp == .rparen) {
+                break;
+            }
+
+            {
+                var w = diagnostic.writer();
+                defer w.deinit();
+                if (commaMaybe.tp.isEos()) {
+                    try w.writer.print(
+                        \\parse error: Expected a ',' or ')' after parameter {} of function '{s}', instead got a newline
+                        \\  NOTE: check that the parameter list of this function is closed with a ')'
+                    ,
+                        .{ paramIndex, fnName },
+                    );
+                } else {
+                    try w.writer.print(
+                        "parse error: Expected a ',' or ')' after parameter {} of function '{s}', instead got '{s}'",
+                        .{ paramIndex, fnName, commaMaybe.currentTokenString },
+                    );
+                }
+                diagnostic.message = try w.toOwnedSlice();
+                diagnostic.from = .from(commaMaybe.currentTokenString);
+                try diagnostic.addRef(.{
+                    .staticMessage = "while parsing parameter list",
+                    .ref = .from(fnName),
+                });
+                if (commaMaybe.tp.isEos()) {
+                    return error.MissingParenthese;
+                }
+                return error.UnexpectedToken;
+            }
+        }
+        const rparen = try self.lexer.getNextToken(diagnostic);
+        if (rparen != .rparen) {
+            var w = diagnostic.writer();
+            defer w.deinit();
+            if (rparen.isEos()) {
+                try w.writer.print(
+                    \\parse error: Expected a ')' to close the parameter list of function '{s}', instead got a newline
+                ,
+                    .{fnName},
+                );
+            } else {
+                try w.writer.print(
+                    "parse error: Expected a ')' to close the parameter list of function '{s}', instead got '{s}'",
+                    .{ fnName, self.lexer.currentTokenString },
+                );
+            }
+            diagnostic.message = try w.toOwnedSlice();
+            diagnostic.from = .from(self.lexer.currentTokenString);
+            try diagnostic.addRef(.{
+                .staticMessage = "while parsing function definition",
+                .ref = .from(fnName),
+            });
+            return error.MissingParenthese;
+        }
+
+        const equal = try self.lexer.getNextToken(diagnostic);
+        if (equal != .op_eq) {
+            var w = diagnostic.writer();
+            defer w.deinit();
+            if (equal.isEos()) {
+                try w.writer.print(
+                    \\parse error: Expected a '=' to start the body of function '{s}', instead got a newline
+                ,
+                    .{fnName},
+                );
+            } else {
+                try w.writer.print(
+                    "parse error: Expected a '=' to start the body of function '{s}', instead got '{s}'",
+                    .{ fnName, self.lexer.currentTokenString },
+                );
+            }
+            diagnostic.message = try w.toOwnedSlice();
+            diagnostic.from = .from(self.lexer.currentTokenString);
+            try diagnostic.addRef(.{
+                .staticMessage = "while parsing function definition",
+                .ref = .from(fnName),
+            });
+            return error.UnexpectedToken;
+        }
+
+        try self.parseBytecode(alloc, diagnostic);
+    }
+
     pub fn pass(self: *Parser, alloc: Allocator, diagnostic: *Diagnostic) Pass1Error!void {
         var currentToken = try self.lexer.getNextToken(diagnostic);
         while (currentToken != .eof) {
-            std.debug.print("{t}\n", .{currentToken});
             switch (currentToken) {
                 .ident => {
                     try self.parseValue(alloc, diagnostic);
                 },
-                .kwd_fn => {},
-                .kwd_import => {},
-                .kwd_foreign => {},
+                .kwd_fn => {
+                    try self.parseFn(alloc, diagnostic);
+                },
+                .kwd_import => unreachable,
+                .kwd_foreign => unreachable,
                 .newline => {
                     currentToken = try self.lexer.getNextToken(diagnostic);
                     continue;
@@ -690,6 +981,20 @@ pub const ParserPass1 = struct {
                 return error.MissingEndOfStatement;
             }
             currentToken = try self.lexer.getNextToken(diagnostic);
+        }
+
+        for (self.scope.items) |item| {
+            if (item.def == null) {
+                var w = diagnostic.writer();
+                defer w.deinit();
+                try w.writer.print(
+                    "parse error: {s} '{s}' is not defined anywhere",
+                    .{ item.tp.nameFor(), item.name },
+                );
+                diagnostic.message = try w.toOwnedSlice();
+                diagnostic.from = .from(item.name);
+                return error.Undefined;
+            }
         }
     }
 };
