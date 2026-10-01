@@ -121,13 +121,44 @@ pub fn doParse(
         .keyrefTable = .empty,
         .scope = .empty,
         .lexer = lexer,
+        .paramNames = .empty,
+        .bytecodeStarts = .empty,
+    };
+    parser.paramNames = .initBuffer(&parser.paramNameBuf);
+
+    defer parser.deinit(gpa);
+
+    var cache: bc.ValueCache = .init();
+    defer cache.deinit(gpa);
+
+    var stackBuffer: [6]f32 = undefined;
+
+    var pass2 = try parser.pass(gpa, &diagnostic);
+
+    var bytecode: bc.BytecodeInterpreter = .{
+        .reader = .{
+            .bytecode = parser.bytecodeStream.arr.items,
+            .pos = 0,
+        },
+        .stackAllocator = .failing,
+        .valueStack = .initBuffer(&stackBuffer),
+        .datastoreAllocator = gpa,
+        .store = .{
+            .maxFrame = 0,
+            .leftFrame = .nil,
+            .rightFrame = .nil,
+            .frames = &.{},
+            .cache = &cache,
+        },
     };
 
-    defer parser.bytecodeStream.arr.deinit(gpa);
-    defer parser.keyrefTable.deinit(gpa);
-    defer parser.scope.deinit(gpa);
+    for (parser.scope.items) |item| {
+        if (item.bytecodeRef) |ref| {
+            bytecode.dbgPrint(ref);
+        }
+    }
 
-    try parser.pass(gpa, &diagnostic);
+    _ = &pass2;
 
     _ = try stdout.write("");
 }
@@ -414,11 +445,13 @@ pub fn cool(
     var stackBuffer: [6]f32 = undefined;
 
     var bytecode: bc.BytecodeInterpreter = .{
-        .bytecode = builder.arr.items,
+        .reader = .{
+            .bytecode = builder.arr.items,
+            .pos = 0,
+        },
         .stackAllocator = .failing,
         .valueStack = .initBuffer(&stackBuffer),
         .datastoreAllocator = gpa,
-        .pos = 0,
         .store = .{
             .maxFrame = maxFrame,
             .leftFrame = .nil,

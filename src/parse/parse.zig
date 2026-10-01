@@ -5,6 +5,12 @@ const files = @import("../fileref.zig");
 const Diagnostic = files.Diagnostic;
 const Allocator = std.mem.Allocator;
 
+// core idea with parsing:
+//
+// if it parses it will execute perfectly fine,
+// this leaves keyrefs as the only potential messing up factor, and we have the
+// keyref table for that
+
 // two passes:
 //
 // first pass emits partial bytecode (so for function calls and bytecode refs and axis
@@ -79,6 +85,8 @@ pub const ScopeItem = struct {
         }
     };
 
+    bytecodeRef: ?bc.BytecodeRef,
+
     name: []const u8,
     tp: Type,
     /// where this thing was defined, null if it was only forward referenced
@@ -87,7 +95,9 @@ pub const ScopeItem = struct {
 };
 
 pub const Pass1Error = error{
+    What,
     Undefined,
+    TooManyParams,
     UnknownAccessType,
     ExcessArguments,
     TooFewArguments,
@@ -98,11 +108,31 @@ pub const Pass1Error = error{
     UnexpectedToken,
 } || lex.LexerError;
 
+const ParseContext = enum {
+    none,
+    paren,
+    function,
+
+    pub fn parenAllowed(self: ParseContext) bool {
+        return self == .function or self == .paren;
+    }
+    pub fn commaAllowed(self: ParseContext) bool {
+        return self == .function;
+    }
+};
+
 pub const ParserPass1 = struct {
     lexer: lex.Lexer,
     bytecodeStream: bc.BytecodeBuilder,
     scope: std.ArrayList(ScopeItem),
     keyrefTable: std.ArrayList([]const u8),
+    paramNameBuf: [32][]const u8 = undefined,
+    paramNames: std.ArrayList([]const u8),
+    bytecodeStarts: std.ArrayList(struct {
+        linemarker: files.FileRef,
+        start: u32,
+    }),
+
     const Parser = ParserPass1;
 
     pub fn findScopeItem(self: *const Parser, name: []const u8, tp: ScopeItem.Type) ?usize {
@@ -111,6 +141,13 @@ pub const ParserPass1 = struct {
             if (std.mem.eql(u8, item.name, name)) break i;
         } else null;
         return found;
+    }
+
+    pub fn deinit(self: *Parser, gpa: Allocator) void {
+        self.bytecodeStream.arr.deinit(gpa);
+        self.scope.deinit(gpa);
+        self.keyrefTable.deinit(gpa);
+        self.bytecodeStarts.deinit(gpa);
     }
 
     /// gets the index of an item in the scope table, creating a forward
@@ -125,6 +162,7 @@ pub const ParserPass1 = struct {
             return @intCast(i);
         }
         try self.scope.append(alloc, .{
+            .bytecodeRef = null,
             .name = name,
             .tp = tp,
         });
@@ -163,6 +201,7 @@ pub const ParserPass1 = struct {
             return @intCast(i);
         }
         try self.scope.append(alloc, .{
+            .bytecodeRef = null,
             .name = name,
             .tp = tp,
             .def = def,
@@ -328,8 +367,25 @@ pub const ParserPass1 = struct {
         });
     }
 
-    pub fn emitFunctionCall(self: *Parser, alloc: Allocator, diagnostic: *Diagnostic) Pass1Error!void {
+    pub fn emitFunctionCallOrParam(self: *Parser, alloc: Allocator, diagnostic: *Diagnostic) Pass1Error!void {
         const fnName = self.lexer.currentTokenString;
+
+        const paramIndex = for (self.paramNames.items, 0..) |name, i| {
+            if (std.mem.eql(u8, name, fnName)) break i;
+        } else null;
+
+        if (paramIndex) |param| {
+            try self.bytecodeStream.addOp(alloc, .{
+                .isKeyref = true,
+                .rest = .{
+                    .keyref = .{ .tp = .fn_arg, .rest = undefined },
+                },
+            });
+            try self.bytecodeStream.addType(bc.BytecodeOp.PushTypes.FnArg, alloc, .{
+                .argIndex = @intCast(self.paramNames.items.len - param - 1),
+            });
+            return;
+        }
 
         const scopeIndex = try self.referenceScopeItem(alloc, fnName, .function);
 
@@ -343,8 +399,20 @@ pub const ParserPass1 = struct {
             ,
                 .{ fnName, self.lexer.currentTokenString },
             );
+            if (self.paramNames.items.len > 0) {
+                try w.writer.print(
+                    \\
+                    \\  NOTE: Expecting a function call because '{s}' is not one of the listed parameters in the current function
+                ,
+                    .{fnName},
+                );
+            }
             diagnostic.message = try w.toOwnedSlice();
             diagnostic.from = .from(self.lexer.currentTokenString);
+            try diagnostic.addRef(.{
+                .staticMessage = "while parsing function call for",
+                .ref = .from(fnName),
+            });
             return error.MissingParenthese;
         }
 
@@ -364,17 +432,16 @@ pub const ParserPass1 = struct {
         const expectedCount: ?u16 =
             if (specialOp) |op| op.argCountOf() else null;
 
-        while (true) {
+        for (0..1000) |_| {
             const peek = try self.lexer.peekNextToken(diagnostic);
             if (peek.tp == .rparen) {
                 break;
             }
             const startMark = self.lexer.mark();
-            try self.parseBytecodeReal(
+            _ = try self.parseBytecodeReal(
                 alloc,
                 lex.Operator.precedenceMax(),
-                .left_to_right,
-                true,
+                .function,
                 diagnostic,
             );
             const endMark = self.lexer.mark();
@@ -430,7 +497,7 @@ pub const ParserPass1 = struct {
             diagnostic.message = try w.toOwnedSlice();
             diagnostic.from = .from(next.currentTokenString);
             return error.MissingParenthese;
-        }
+        } else unreachable;
         // rparen
         _ = try self.lexer.getNextToken(diagnostic);
 
@@ -502,11 +569,11 @@ pub const ParserPass1 = struct {
         self: *Parser,
         alloc: Allocator,
         precedence: u32,
-        associativity: lex.Operator.Associativity,
-        inFunction: bool,
+        parseContext: ParseContext,
         diagnostic: *Diagnostic,
-    ) Pass1Error!void {
+    ) Pass1Error!bc.BytecodeRef {
         const token = try self.lexer.getNextToken(diagnostic);
+        const start = self.bytecodeStream.arr.items.len;
 
         switch (token) {
             .keyref => {
@@ -516,7 +583,12 @@ pub const ParserPass1 = struct {
                 try self.emitValueref(alloc, diagnostic);
             },
             .op_minus => {
-                try self.parseBytecodeReal(alloc, precedence, associativity, inFunction, diagnostic);
+                _ = try self.parseBytecodeReal(
+                    alloc,
+                    lex.Operator.negation.precedence(),
+                    parseContext,
+                    diagnostic,
+                );
                 try self.bytecodeStream.addOp(alloc, .{
                     .isKeyref = false,
                     .rest = .{
@@ -525,7 +597,7 @@ pub const ParserPass1 = struct {
                 });
             },
             .ident => {
-                try self.emitFunctionCall(alloc, diagnostic);
+                try self.emitFunctionCallOrParam(alloc, diagnostic);
             },
             .number => {
                 try self.bytecodeStream.addOp(alloc, .{
@@ -540,7 +612,49 @@ pub const ParserPass1 = struct {
 
                 try self.bytecodeStream.addType(f32, alloc, self.lexer.currentNumber.?);
             },
-            else => unreachable,
+            .lparen => {
+                const lparenStr = self.lexer.currentTokenString;
+                _ = try self.parseBytecodeReal(
+                    alloc,
+                    lex.Operator.precedenceMax(),
+                    .paren,
+                    diagnostic,
+                );
+
+                const rparen = try self.lexer.getNextToken(diagnostic);
+                if (rparen != .rparen) {
+                    var w = diagnostic.writer();
+                    defer w.deinit();
+
+                    try w.writer.print(
+                        "parse error: Expected a ')' to close a '(', instead got '{s}'",
+                        .{
+                            self.lexer.currentTokenString,
+                        },
+                    );
+                    diagnostic.message = try w.toOwnedSlice();
+                    diagnostic.from = .from(self.lexer.currentTokenString);
+                    try diagnostic.addRef(.{
+                        .staticMessage = "from left parenthese",
+                        .ref = .from(lparenStr),
+                    });
+                    return error.UnexpectedToken;
+                }
+            },
+            else => {
+                var w = diagnostic.writer();
+                defer w.deinit();
+
+                try w.writer.print(
+                    "parse error: Expected something to start an expression (a keyref, a value reference, an identifier, a number, a '(', or a '-'), instead got '{s}'",
+                    .{
+                        self.lexer.currentTokenString,
+                    },
+                );
+                diagnostic.message = try w.toOwnedSlice();
+                diagnostic.from = .from(self.lexer.currentTokenString);
+                return error.UnexpectedToken;
+            },
         }
 
         // 1 + 2 * 3 * 4
@@ -565,10 +679,10 @@ pub const ParserPass1 = struct {
         //  emit +
         //  exit on seeing equal precedence because left associative
 
-        while (true) {
+        for (0..1000) |_| {
             const opTok = try self.lexer.peekNextToken(diagnostic);
-            if (opTok.tp == .comma and inFunction) break;
-            if (opTok.tp == .rparen and inFunction) break;
+            if (opTok.tp == .comma and parseContext.commaAllowed()) break;
+            if (opTok.tp == .rparen and parseContext.parenAllowed()) break;
             if (opTok.tp.isEos()) break;
             if (!opTok.tp.isOp()) {
                 var w = diagnostic.writer();
@@ -599,11 +713,10 @@ pub const ParserPass1 = struct {
             if (op.precedence() + add <= precedence) {
                 _ = try self.lexer.getNextToken(diagnostic);
 
-                try self.parseBytecodeReal(
+                _ = try self.parseBytecodeReal(
                     alloc,
                     op.precedence(),
-                    op.associativity(),
-                    inFunction,
+                    parseContext,
                     diagnostic,
                 );
 
@@ -616,6 +729,7 @@ pub const ParserPass1 = struct {
                     .lt => .lt,
                     .gte => .gte,
                     .lte => .lte,
+                    .negation => unreachable,
                 };
 
                 try self.bytecodeStream.addOp(alloc, .{
@@ -624,16 +738,20 @@ pub const ParserPass1 = struct {
                         .operation = opReal,
                     },
                 });
-            }
-        }
+            } else break;
+        } else unreachable;
+        const len = self.bytecodeStream.arr.items.len - start;
+        return .{
+            .start = @intCast(start),
+            .len = @intCast(len),
+        };
     }
 
-    pub fn parseBytecode(self: *Parser, alloc: Allocator, diagnostic: *Diagnostic) Pass1Error!void {
-        try self.parseBytecodeReal(
+    pub fn parseBytecode(self: *Parser, alloc: Allocator, diagnostic: *Diagnostic) Pass1Error!bc.BytecodeRef {
+        return try self.parseBytecodeReal(
             alloc,
             lex.Operator.precedenceMax(),
-            .left_to_right,
-            false,
+            .none,
             diagnostic,
         );
     }
@@ -642,18 +760,20 @@ pub const ParserPass1 = struct {
         const identName = self.lexer.currentTokenString;
 
         const maybeValueRef = try self.lexer.peekNextToken(diagnostic);
-        if (maybeValueRef.tp == .valuerefdecl) {
-            _ = try self.lexer.getNextToken(diagnostic);
-            _ = try self.defineScopeItem(
-                alloc,
-                self.lexer.currentString.?,
-                .valueref,
-                .from(self.lexer.currentTokenString),
-                diagnostic,
-            );
-        }
+        const scopeIndex =
+            if (maybeValueRef.tp == .valuerefdecl) blk: {
+                _ = try self.lexer.getNextToken(diagnostic);
+                break :blk try self.defineScopeItem(
+                    alloc,
+                    self.lexer.currentString.?,
+                    .valueref,
+                    .from(self.lexer.currentTokenString),
+                    diagnostic,
+                );
+            } else null;
 
         const token = try self.lexer.getNextToken(diagnostic);
+        var bytecodeRef: ?bc.BytecodeRef = null;
         switch (token) {
             .string => {},
             .op_minus => {
@@ -685,7 +805,11 @@ pub const ParserPass1 = struct {
             .ident => {},
             .nakedvalueref => {},
             .op_eq => {
-                try self.parseBytecode(alloc, diagnostic);
+                try self.bytecodeStarts.append(alloc, .{
+                    .start = @intCast(self.bytecodeStream.arr.items.len),
+                    .linemarker = .from(identName),
+                });
+                bytecodeRef = try self.parseBytecode(alloc, diagnostic);
             },
             else => {
                 if (maybeValueRef.tp == .valuerefdecl) {
@@ -728,6 +852,12 @@ pub const ParserPass1 = struct {
             },
         }
 
+        if (scopeIndex) |i| {
+            if (bytecodeRef) |ref| {
+                self.scope.items[i].bytecodeRef = ref;
+            }
+        }
+
         const next = try self.lexer.peekNextToken(diagnostic);
         if (!next.tp.isEos()) {
             var w = diagnostic.writer();
@@ -751,9 +881,13 @@ pub const ParserPass1 = struct {
         }
     }
 
-    pub fn parseFn(self: *Parser, alloc: Allocator, diagnostic: *Diagnostic) Pass1Error!void {
+    pub fn parseFunctionDefinition(self: *Parser, alloc: Allocator, diagnostic: *Diagnostic) Pass1Error!void {
         const fnKeywordStr = self.lexer.currentTokenString;
         const name = try self.lexer.getNextToken(diagnostic);
+        try self.bytecodeStarts.append(alloc, .{
+            .start = @intCast(self.bytecodeStream.arr.items.len),
+            .linemarker = .from(self.lexer.currentTokenString),
+        });
 
         if (name != .ident) {
             const isKwd = std.mem.startsWith(u8, @tagName(name), "kwd_");
@@ -786,7 +920,7 @@ pub const ParserPass1 = struct {
 
         const fnName = self.lexer.currentTokenString;
 
-        _ = try self.defineScopeItem(
+        const scopeIndex = try self.defineScopeItem(
             alloc,
             fnName,
             .function,
@@ -822,7 +956,12 @@ pub const ParserPass1 = struct {
         }
 
         var paramIndex: usize = 0;
-        while (true) {
+
+        defer while (self.paramNames.items.len > 0) {
+            _ = self.paramNames.pop();
+        };
+
+        for (0..1000) |_| {
             const next = try self.lexer.peekNextToken(diagnostic);
             if (next.tp == .rparen) {
                 break;
@@ -867,6 +1006,27 @@ pub const ParserPass1 = struct {
                 }
                 return error.UnexpectedToken;
             }
+
+            if (self.paramNames.unusedCapacitySlice().len == 0) {
+                var w = diagnostic.writer();
+                defer w.deinit();
+                try w.writer.print(
+                    \\parse error: Too many parameter declarations for function '{s}'
+                    \\  NOTE: Maximum number of parameters is {}
+                ,
+                    .{ fnName, self.paramNameBuf.len },
+                );
+                diagnostic.message = try w.toOwnedSlice();
+                diagnostic.from = .from(self.lexer.currentTokenString);
+                try diagnostic.addRef(.{
+                    .staticMessage = "while parsing parameter list",
+                    .ref = .from(fnName),
+                });
+                return error.TooManyParams;
+            }
+
+            self.paramNames.appendAssumeCapacity(self.lexer.currentTokenString);
+
             paramIndex += 1;
 
             const commaMaybe = try self.lexer.peekNextToken(diagnostic);
@@ -905,7 +1065,7 @@ pub const ParserPass1 = struct {
                 }
                 return error.UnexpectedToken;
             }
-        }
+        } else unreachable;
         const rparen = try self.lexer.getNextToken(diagnostic);
         if (rparen != .rparen) {
             var w = diagnostic.writer();
@@ -956,8 +1116,152 @@ pub const ParserPass1 = struct {
             return error.UnexpectedToken;
         }
 
-        try self.parseBytecode(alloc, diagnostic);
+        self.scope.items[scopeIndex].bytecodeRef = try self.parseBytecode(alloc, diagnostic);
     }
+
+    fn findClosestUsageString(self: *Parser, bytecodePos: u32) ![]const u8 {
+        if (bytecodePos > self.bytecodeStream.arr.items.len) {
+            return error.What;
+        }
+
+        for (self.bytecodeStarts.items, 0..) |item, i| {
+            if (i + 1 > self.bytecodeStarts.items.len) return item.linemarker.str;
+            if (self.bytecodeStarts.items[i + 1].start > bytecodePos) {
+                return item.linemarker.str;
+            }
+        }
+        unreachable;
+    }
+
+    pub fn pass(self: *Parser, alloc: Allocator, diagnostic: *Diagnostic) Pass1Error!ParserPass2 {
+        var currentToken = try self.lexer.getNextToken(diagnostic);
+        while (currentToken != .eof) {
+            switch (currentToken) {
+                .ident => {
+                    try self.parseValue(alloc, diagnostic);
+                },
+                .kwd_fn => {
+                    try self.parseFunctionDefinition(alloc, diagnostic);
+                },
+                .kwd_import => unreachable,
+                .kwd_foreign => unreachable,
+                .newline => {
+                    currentToken = try self.lexer.getNextToken(diagnostic);
+                    continue;
+                },
+                else => unreachable,
+            }
+            currentToken = try self.lexer.getNextToken(diagnostic);
+            if (currentToken != .newline and currentToken != .eof) {
+                var w = diagnostic.writer();
+                defer w.deinit();
+                try w.writer.print(
+                    "parse error: Expected a newline after finishing a statement, instead got '{s}'",
+                    .{self.lexer.currentTokenString},
+                );
+                diagnostic.message = try w.toOwnedSlice();
+                diagnostic.from = .from(self.lexer.currentTokenString);
+                return error.MissingEndOfStatement;
+            }
+            currentToken = try self.lexer.getNextToken(diagnostic);
+        }
+
+        // pass to ensure that all valuerefs and functions were properly defined
+        for (self.scope.items) |item| {
+            if (item.def == null) {
+                var w = diagnostic.writer();
+                defer w.deinit();
+                try w.writer.print(
+                    "parse error: {s} '{s}' is not defined anywhere",
+                    .{ item.tp.nameFor(), item.name },
+                );
+                diagnostic.message = try w.toOwnedSlice();
+                diagnostic.from = .from(item.name);
+                return error.Undefined;
+            }
+        }
+
+        var reader: bc.BytecodeReader = .{
+            .bytecode = self.bytecodeStream.arr.items,
+            .pos = 0,
+        };
+
+        // pass to convert all the bytecode into actually executable
+        // bytecode (aka resolve all the temporary refs that were left earlier
+        // for function calls and axes). properly resolving the keyref values
+        // happens later
+        while (reader.pos < reader.bytecode.len) {
+            const op = reader.eatOp();
+            if (op.isKeyref) {
+                switch (op.rest.keyref.tp) {
+                    .axis => {
+                        const argPos = reader.pos;
+                        const T = bc.BytecodeReader.GetTypeForPush(.axis);
+                        comptime std.debug.assert(T == bc.BytecodeRef);
+                        const args = reader.eatPushArgs(.axis);
+
+                        const scopeId = args.start;
+
+                        const ref = self.scope.items[scopeId].bytecodeRef orelse {
+                            var w = diagnostic.writer();
+                            defer w.deinit();
+                            try w.writer.print(
+                                "parse error: Keyref '{s}' is not defined as a reference to bytecode!",
+                                .{self.scope.items[scopeId].name},
+                            );
+                            diagnostic.message = try w.toOwnedSlice();
+                            diagnostic.from = .from(self.scope.items[scopeId].name);
+                            try diagnostic.addRef(.{
+                                .staticMessage = "first definition:",
+                                .ref = .from(try self.findClosestUsageString(argPos)),
+                            });
+                            return error.Undefined;
+                        };
+
+                        const region = self.bytecodeStream.arr.items[argPos .. argPos + @bitSizeOf(bc.BytecodeRef) / 8];
+                        const value: []const u8 = @ptrCast(&ref);
+                        @memcpy(region, value);
+                    },
+                    else => {
+                        reader.pos += bc.BytecodeReader.getTypeSizeForPush(op.rest.keyref.tp);
+                    },
+                }
+            } else {
+                switch (op.rest.operation) {
+                    .call => {
+                        const argPos = reader.pos;
+
+                        const A = bc.BytecodeOp.OpTypes.FnCallArgs;
+                        const args = reader.eatType(A);
+
+                        const scopeId = args.bytecode.start;
+
+                        const ref = self.scope.items[scopeId].bytecodeRef orelse unreachable;
+
+                        const realArgPos = argPos + @bitOffsetOf(A, "bytecode");
+                        comptime std.debug.assert(
+                            @FieldType(A, "bytecode") == bc.BytecodeRef,
+                        );
+
+                        const region = self.bytecodeStream.arr.items[realArgPos .. realArgPos + @bitSizeOf(bc.BytecodeRef) / 8];
+                        const value: []const u8 = @ptrCast(&ref);
+                        @memcpy(region, value);
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        return undefined;
+    }
+};
+
+pub const ParserPass2 = struct {
+    lexer: lex.Lexer,
+    bytecodePos: u32,
+    scope: std.ArrayList(ScopeItem),
+    keyrefTable: std.ArrayList([]const u8),
+    const Parser = ParserPass2;
 
     pub fn pass(self: *Parser, alloc: Allocator, diagnostic: *Diagnostic) Pass1Error!void {
         var currentToken = try self.lexer.getNextToken(diagnostic);

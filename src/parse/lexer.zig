@@ -92,12 +92,13 @@ pub const Operator = enum {
     lt,
     gte,
     lte,
+    negation,
 
     pub fn associativity(op: Operator) Associativity {
         // just yoinked c's operator precedence
         // https://en.cppreference.com/c/language/operator_precedence
         return switch (op) {
-            .times, .div, .plus, .minus, .gt, .lt, .gte, .lte => .left_to_right,
+            .negation, .times, .div, .plus, .minus, .gt, .lt, .gte, .lte => .left_to_right,
         };
     }
     pub fn precedenceMax() u32 {
@@ -107,6 +108,7 @@ pub const Operator = enum {
         // just yoinked c's operator precedence
         // https://en.cppreference.com/c/language/operator_precedence
         return switch (op) {
+            .negation => 2,
             .times, .div => 3,
             .plus, .minus => 4,
             .gt, .lt, .gte, .lte => 5,
@@ -116,6 +118,7 @@ pub const Operator = enum {
 
 comptime {
     for (std.meta.fieldNames(Operator)) |field| {
+        if (std.mem.eql(u8, field, "negation")) continue;
         std.debug.assert(std.meta.fieldIndex(TokenType, "op_" ++ field) != null);
     }
     for (std.meta.fieldNames(TokenType)) |field| {

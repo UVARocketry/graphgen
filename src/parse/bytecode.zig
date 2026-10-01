@@ -56,8 +56,6 @@ pub const BytecodeRef = struct {
     len: u16,
 };
 
-// TODO: use this
-
 pub const BytecodeOp = packed struct(u8) {
     pub const PushTypes = packed struct(u7) {
         pub const KeyrefArg = packed struct(u8) {
@@ -271,15 +269,11 @@ pub const DataStore = struct {
     cache: *ValueCache,
 };
 
-pub const BytecodeInterpreter = struct {
+pub const BytecodeReader = struct {
     bytecode: []const u8,
     pos: u32,
-    valueStack: std.ArrayList(f32),
-    stackAllocator: std.mem.Allocator,
-    datastoreAllocator: std.mem.Allocator,
-    store: DataStore,
 
-    pub fn eatOp(self: *BytecodeInterpreter) BytecodeOp {
+    pub fn eatOp(self: *BytecodeReader) BytecodeOp {
         std.debug.assert(self.pos < self.bytecode.len);
         const value: BytecodeOp = @bitCast(self.bytecode[self.pos]);
         self.pos += 1;
@@ -302,10 +296,11 @@ pub const BytecodeInterpreter = struct {
             .fn_arg => BytecodeOp.PushTypes.FnArg,
         };
     }
-    pub fn eatPushArgs(self: *BytecodeInterpreter, comptime tp: BytecodeOp.PushTypes.Tp) GetTypeForPush(tp) {
+    pub fn eatPushArgs(self: *BytecodeReader, comptime tp: BytecodeOp.PushTypes.Tp) GetTypeForPush(tp) {
         return self.eatType(GetTypeForPush(tp));
     }
-    pub fn eatType(self: *BytecodeInterpreter, comptime T: type) T {
+
+    pub fn eatType(self: *BytecodeReader, comptime T: type) T {
         comptime if (T == void) {
             return {};
         };
@@ -316,7 +311,7 @@ pub const BytecodeInterpreter = struct {
 
         const tSize = @bitSizeOf(T) / 8;
 
-        std.debug.assert(self.pos + tSize < self.bytecode.len);
+        std.debug.assert(self.pos + tSize <= self.bytecode.len);
 
         const slice = self.bytecode[self.pos .. self.pos + tSize];
 
@@ -326,7 +321,14 @@ pub const BytecodeInterpreter = struct {
 
         return v.*;
     }
+};
 
+pub const BytecodeInterpreter = struct {
+    reader: BytecodeReader,
+    valueStack: std.ArrayList(f32),
+    stackAllocator: std.mem.Allocator,
+    datastoreAllocator: std.mem.Allocator,
+    store: DataStore,
     pub fn popValue(self: *BytecodeInterpreter) f32 {
         return self.valueStack.pop().?;
     }
@@ -418,7 +420,7 @@ pub const BytecodeInterpreter = struct {
     }
 
     pub fn execOne(self: *BytecodeInterpreter, frameNo: u32, argBase: u32) void {
-        const op = self.eatOp();
+        const op = self.reader.eatOp();
 
         if (op.isKeyref) {
             const KeyrefArg = BytecodeOp.PushTypes.KeyrefArg;
@@ -426,7 +428,7 @@ pub const BytecodeInterpreter = struct {
             switch (op.rest.keyref.tp) {
                 else => unreachable,
                 .keyref => {
-                    const v: KeyrefArg = self.eatPushArgs(.keyref);
+                    const v: KeyrefArg = self.reader.eatPushArgs(.keyref);
                     if (op.rest.keyref.rest.keyref == .current) {
                         self.pushValue(
                             self.store.frames[v.keyrefId].valueAtFrame(frameNo),
@@ -441,11 +443,11 @@ pub const BytecodeInterpreter = struct {
                     }
                 },
                 .value => {
-                    const v = self.eatPushArgs(.value);
+                    const v = self.reader.eatPushArgs(.value);
                     self.pushValue(v);
                 },
                 .fn_arg => {
-                    const argId: FnArg = self.eatPushArgs(.fn_arg);
+                    const argId: FnArg = self.reader.eatPushArgs(.fn_arg);
                     // help:
                     // argId is 0, argBase is 0 (no items in stack)
                     // argId is 0, argBase is 1 (1 item in stack) (valid)
@@ -459,7 +461,7 @@ pub const BytecodeInterpreter = struct {
             switch (op.rest.operation) {
                 .call => {
                     const T = BytecodeOp.OpTypes.FnCallArgs;
-                    const args: T = self.eatType(T);
+                    const args: T = self.reader.eatType(T);
 
                     const value = self.execRange(args.bytecode, 0.0) catch unreachable;
 
@@ -495,19 +497,19 @@ pub const BytecodeInterpreter = struct {
     pub fn execRange(self: *BytecodeInterpreter, range: BytecodeRef, frameNo: u32) !f32 {
         const stackStart = self.valueStack.items.len;
 
-        const old = self.pos;
-        defer self.pos = old;
+        const old = self.reader.pos;
+        defer self.reader.pos = old;
 
-        self.pos = range.start;
+        self.reader.pos = range.start;
         var lastPos: u32 = std.math.maxInt(u32);
 
-        while (self.pos < range.start + range.len) {
-            std.debug.print("Exec at pos {}\n", .{self.pos});
+        while (self.reader.pos < range.start + range.len) {
+            std.debug.print("Exec at pos {}\n", .{self.reader.pos});
             self.execOne(frameNo, @intCast(stackStart));
-            if (self.pos == lastPos) {
+            if (self.reader.pos == lastPos) {
                 return std.math.nan(f32);
             }
-            lastPos = self.pos;
+            lastPos = self.reader.pos;
         }
 
         if (self.valueStack.items.len != stackStart + 1) {
@@ -523,24 +525,24 @@ pub const BytecodeInterpreter = struct {
         var current: u32 = 0;
         var max: u32 = 0;
 
-        const old = self.pos;
-        defer self.pos = old;
+        const old = self.reader.pos;
+        defer self.reader.pos = old;
 
-        self.pos = range.start;
+        self.reader.pos = range.start;
         var lastPos: u32 = std.math.maxInt(u32);
 
-        while (self.pos < range.start + range.len) {
-            const op = self.eatOp();
+        while (self.reader.pos < range.start + range.len) {
+            const op = self.reader.eatOp();
 
-            if (self.pos == lastPos) {
+            if (self.reader.pos == lastPos) {
                 return error.hwut;
             }
-            lastPos = self.pos;
+            lastPos = self.reader.pos;
 
             if (op.isKeyref) {
                 current += 1;
                 max = @max(current, max);
-                self.pos += getTypeSizeForPush(op.rest.keyref.tp);
+                self.reader.pos += BytecodeReader.getTypeSizeForPush(op.rest.keyref.tp);
             } else {
                 switch (op.rest.operation) {
                     // no change
@@ -561,7 +563,7 @@ pub const BytecodeInterpreter = struct {
                     },
                     .call => {
                         const T = BytecodeOp.OpTypes.FnCallArgs;
-                        const v: T = self.eatType(T);
+                        const v: T = self.reader.eatType(T);
                         const fnSize = try self.getMaxStackUsage(v.bytecode);
                         max = @max(max, current + fnSize);
                         current += 1;
@@ -572,6 +574,335 @@ pub const BytecodeInterpreter = struct {
         }
 
         return max;
+    }
+
+    fn printStackAst(self: *BytecodeInterpreter, range: BytecodeRef, indent: u8) u16 {
+        const startPos = self.reader.pos;
+        defer self.reader.pos = startPos;
+        var endPos = range.start;
+
+        var bytesConsumed: u16 = 0;
+
+        while (true) {
+            var len: u16 = 1;
+            const op: BytecodeOp = @bitCast(self.reader.bytecode[endPos]);
+
+            if (op.isKeyref) {
+                len += @intCast(BytecodeReader.getTypeSizeForPush(op.rest.keyref.tp));
+            } else {
+                if (op.rest.operation == .call) {
+                    len += @bitSizeOf(BytecodeOp.OpTypes.FnCallArgs) / 8;
+                }
+            }
+
+            if (endPos + len >= range.start + range.len) {
+                bytesConsumed = len;
+                break;
+            }
+            endPos += len;
+        }
+
+        self.reader.pos = endPos;
+
+        const op = self.reader.eatOp();
+
+        for (0..indent) |_| std.debug.print("  ", .{});
+        if (op.isKeyref) {
+            switch (op.rest.keyref.tp) {
+                .keyref => {
+                    const args = self.reader.eatPushArgs(.keyref);
+                    std.debug.print("keyref {}:{t}\n", .{
+                        args.keyrefId,
+                        op.rest.keyref.rest.keyref,
+                    });
+                },
+                .axis => {
+                    const args = self.reader.eatPushArgs(.axis);
+                    std.debug.print("axis @ ({}, {}):{t}\n", .{
+                        args.start,
+                        args.len,
+                        op.rest.keyref.rest.keyref,
+                    });
+                },
+                .value => {
+                    const args = self.reader.eatPushArgs(.value);
+                    std.debug.print("value={}\n", .{args});
+                },
+                .fn_arg => {
+                    const args = self.reader.eatPushArgs(.fn_arg);
+                    std.debug.print("argument {}\n", .{args.argIndex});
+                },
+            }
+        } else {
+            switch (op.rest.operation) {
+                .call => {
+                    const args = self.reader.eatType(BytecodeOp.OpTypes.FnCallArgs);
+                    std.debug.print("call @ ({}, {}) [{}]\n", .{
+                        args.bytecode.start,
+                        args.bytecode.len,
+                        args.argsPassed,
+                    });
+                    for (0..args.argsPassed) |_| {
+                        bytesConsumed += self.printStackAst(
+                            .{
+                                .start = range.start,
+                                .len = range.len - bytesConsumed,
+                            },
+                            indent + 1,
+                        );
+                    }
+                },
+                .negate => {
+                    std.debug.print("*-1\n", .{});
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                },
+                .plus => {
+                    std.debug.print("+\n", .{});
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                },
+                .sp_sqrt => {
+                    std.debug.print("sqrt\n", .{});
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                },
+                .sp_abs => {
+                    std.debug.print("abs\n", .{});
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                },
+                .sp_ln => {
+                    std.debug.print("ln\n", .{});
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                },
+                .sp_exp => {
+                    std.debug.print("exp\n", .{});
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                },
+                .minus => {
+                    std.debug.print("-\n", .{});
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                },
+                .times => {
+                    std.debug.print("*\n", .{});
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                },
+                .div => {
+                    std.debug.print("/\n", .{});
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                },
+                .sp_max => {
+                    std.debug.print("max\n", .{});
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                },
+                .sp_min => {
+                    std.debug.print("min\n", .{});
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                },
+                .sp_pow => {
+                    std.debug.print("pow\n", .{});
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                },
+                .gte => {
+                    std.debug.print(">=\n", .{});
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                },
+                .gt => {
+                    std.debug.print(">\n", .{});
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                },
+                .lte => {
+                    std.debug.print("<=\n", .{});
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                },
+                .lt => {
+                    std.debug.print("<\n", .{});
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                },
+            }
+        }
+        return @intCast(bytesConsumed);
+    }
+    pub fn dbgPrint(self: *BytecodeInterpreter, range: BytecodeRef) void {
+        var bytesConsumed: u16 = 0;
+        while (bytesConsumed < range.len) {
+            const c = self.printStackAst(
+                .{ .start = range.start, .len = range.len - bytesConsumed },
+                0,
+            );
+            if (c == 0) break;
+            bytesConsumed += c;
+        }
     }
 };
 
