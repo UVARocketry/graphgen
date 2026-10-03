@@ -8,6 +8,7 @@ const parseOut = @import("parse_txt.zig");
 const second = @import("passes/second.zig");
 const third = @import("passes/third.zig");
 const interpret = @import("passes/interpret.zig");
+const Res = @import("parse/resulttype.zig").Graphs;
 const bc = @import("parse/bytecode.zig");
 const parse = @import("parse/parse.zig");
 
@@ -460,6 +461,7 @@ pub fn cool(
             .cache = &cache,
         },
     };
+
     std.debug.print("Stack usage: {}\n", .{try bytecode.getMaxStackUsage(restRef)});
 
     const value = try bytecode.execRange(restRef, 3);

@@ -13,12 +13,15 @@ const Allocator = std.mem.Allocator;
 
 // two passes:
 //
-// first pass emits partial bytecode (so for function calls and bytecode refs and axis
-// refs and value refs, we put in a placeholder bytecode), it also makes note of all
-// available functions, their actual bytecode values, all available refs etc
+// first pass emits full bytecode for everything (it allows functions and valuerefs
+// to be defined out of order so there's some cleanup passes after it finishes main
+// pass)
 //
-// second pass goes over, emits the real type, also finalizes the emitted bytecode
-// earlier
+// second pass emits the actual type. wait lowkey pass 2 could just be part of pass 1.
+// ok, so pass 2 can only be merged with pass 1 if we disallow naming a vlaueref after
+// using it. like i dont think that's a super unfair thing, it does feel like it could
+// be confusing to reference a valueref before creating it, this also prevents
+// recursive value referencing
 
 // TODO: uhhh lowkey dont think we need to even emit an ast, we can just emit bytecode
 
@@ -316,9 +319,10 @@ pub const ParserPass1 = struct {
         }
 
         const A = bc.BytecodeOp.PushTypes.AccessType;
-        const value: A = inline for (@typeInfo(A).@"enum".fields) |field| {
-            if (std.mem.eql(u8, field.name, self.lexer.currentTokenString)) {
-                break @enumFromInt(field.value);
+        const info_A: std.builtin.Type.Enum = @typeInfo(A).@"enum";
+        const value: A = inline for (info_A.field_names, info_A.field_values) |name, value| {
+            if (std.mem.eql(u8, name, self.lexer.currentTokenString)) {
+                break @fromBackingInt(@intCast(value));
             }
         } else {
             var w = diagnostic.writer();
@@ -328,10 +332,9 @@ pub const ParserPass1 = struct {
             ,
                 .{self.lexer.currentTokenString},
             );
-            const fields = @typeInfo(A).@"enum".fields;
-            try w.writer.print("'{s}'", .{fields[0].name});
-            inline for (fields[1..]) |field| {
-                try w.writer.print(", '{s}'", .{field.name});
+            try w.writer.print("'{s}'", .{info_A.field_names[0]});
+            inline for (info_A.field_names[1..]) |name| {
+                try w.writer.print(", '{s}'", .{name});
             }
             diagnostic.message = try w.toOwnedSlice();
             diagnostic.from = .from(self.lexer.currentTokenString);
@@ -418,12 +421,13 @@ pub const ParserPass1 = struct {
 
         var argsCount: u16 = 0;
 
+        const infoOpTypes = @typeInfo(bc.BytecodeOp.OpTypes).@"enum";
         const specialOp: ?bc.BytecodeOp.OpTypes =
-            inline for (std.meta.fields(bc.BytecodeOp.OpTypes)) |field| {
-                if (std.mem.startsWith(u8, field.name, "sp_")) {
-                    const start = if (field.name.len < 3) field.name.len else 3;
-                    if (std.mem.eql(u8, fnName, field.name[start..])) {
-                        const op: bc.BytecodeOp.OpTypes = @enumFromInt(field.value);
+            inline for (infoOpTypes.field_names, infoOpTypes.field_values) |name, value| {
+                if (std.mem.startsWith(u8, name, "sp_")) {
+                    const start = if (name.len < 3) name.len else 3;
+                    if (std.mem.eql(u8, fnName, name[start..])) {
+                        const op: bc.BytecodeOp.OpTypes = @fromBackingInt(@intCast(value));
                         break op;
                     }
                 }
@@ -1218,7 +1222,7 @@ pub const ParserPass1 = struct {
                             return error.Undefined;
                         };
 
-                        const region = self.bytecodeStream.arr.items[argPos .. argPos + @bitSizeOf(bc.BytecodeRef) / 8];
+                        const region = self.bytecodeStream.arr.items[argPos .. argPos + @sizeOf(bc.BytecodeRef)];
                         const value: []const u8 = @ptrCast(&ref);
                         @memcpy(region, value);
                     },
@@ -1243,7 +1247,7 @@ pub const ParserPass1 = struct {
                             @FieldType(A, "bytecode") == bc.BytecodeRef,
                         );
 
-                        const region = self.bytecodeStream.arr.items[realArgPos .. realArgPos + @bitSizeOf(bc.BytecodeRef) / 8];
+                        const region = self.bytecodeStream.arr.items[realArgPos .. realArgPos + @sizeOf(bc.BytecodeRef)];
                         const value: []const u8 = @ptrCast(&ref);
                         @memcpy(region, value);
                     },

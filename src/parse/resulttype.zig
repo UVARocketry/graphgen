@@ -20,6 +20,13 @@ pub fn Bytecode(keyrefs: bool, axisrefs: bool) type {
     };
 }
 
+pub const AllowedPrimitives = enum {
+    float,
+    bytecode,
+    string,
+    enumeration,
+};
+
 // pub fn ValueOf(things: []const []const []const u8, T: type) type {
 //     return struct {
 //         pub const special: SpecialTypes = .handle;

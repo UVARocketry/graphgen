@@ -67,7 +67,7 @@ pub const BytecodeOp = packed struct(u8) {
         pub const Value = f32;
 
         comptime {
-            std.debug.assert(@bitSizeOf(AxisArg) == @bitSizeOf(Value));
+            std.debug.assert(@sizeOf(AxisArg) == @sizeOf(Value));
         }
 
         pub const FnArg = packed struct(u8) {
@@ -281,9 +281,10 @@ pub const BytecodeReader = struct {
     }
 
     pub fn getTypeSizeForPush(tp: BytecodeOp.PushTypes.Tp) u32 {
-        inline for (@typeInfo(BytecodeOp.PushTypes.Tp).@"enum".fields) |field| {
-            if (field.value == @intFromEnum(tp)) {
-                return @sizeOf(GetTypeForPush(@enumFromInt(field.value)));
+        const info_T = @typeInfo(BytecodeOp.PushTypes.Tp).@"enum";
+        inline for (info_T.field_values) |value| {
+            if (value == @backingInt(tp)) {
+                return @sizeOf(GetTypeForPush(@fromBackingInt(@intCast(value))));
             }
         }
         unreachable;
@@ -305,11 +306,7 @@ pub const BytecodeReader = struct {
             return {};
         };
 
-        comptime if (@bitSizeOf(T) % 8 != 0) {
-            @compileError(std.fmt.comptimePrint("Passed type {} to eatType does not have byte multiple size (note: expected size multiple of 8, got {})", .{ T, @bitSizeOf(T) }));
-        };
-
-        const tSize = @bitSizeOf(T) / 8;
+        const tSize = @sizeOf(T);
 
         std.debug.assert(self.pos + tSize <= self.bytecode.len);
 
@@ -591,7 +588,7 @@ pub const BytecodeInterpreter = struct {
                 len += @intCast(BytecodeReader.getTypeSizeForPush(op.rest.keyref.tp));
             } else {
                 if (op.rest.operation == .call) {
-                    len += @bitSizeOf(BytecodeOp.OpTypes.FnCallArgs) / 8;
+                    len += @sizeOf(BytecodeOp.OpTypes.FnCallArgs);
                 }
             }
 
