@@ -1,18 +1,18 @@
 const std = @import("std");
 const Io = std.Io;
-const lex = @import("parse/lexer.zig");
-const f = @import("fileref.zig");
 const Allocator = std.mem.Allocator;
-const first = @import("passes/first.zig");
-const parseOut = @import("parse_txt.zig");
-const second = @import("passes/second.zig");
-const third = @import("passes/third.zig");
-const interpret = @import("passes/interpret.zig");
-const Res = @import("parse/resulttype.zig").Graphs;
-const bc = @import("parse/bytecode.zig");
-const parse = @import("parse/parse.zig");
-
 const debuggraph_zig = @import("debuggraph_zig");
+const bc = debuggraph_zig.bc;
+const lex = debuggraph_zig.lex;
+const f = debuggraph_zig.f;
+const first = debuggraph_zig.first;
+const parseOut = debuggraph_zig.parseOut;
+const second = debuggraph_zig.second;
+const third = debuggraph_zig.third;
+const interpret = debuggraph_zig.interpret;
+const graph = debuggraph_zig.graph;
+// const Res = @import("parse/types.zig").Graphs;
+const parse = debuggraph_zig.parse;
 
 const PlotArgs = struct {
     jsonFile: []const u8,
@@ -46,6 +46,142 @@ pub fn parsePlot(args: []const []const u8, errorStr: *[]const u8) !PlotArgs {
     }
 
     return ret;
+}
+
+const GraphArgs = struct {
+    file: []const u8,
+    outputType: graph.OutType,
+};
+
+pub fn parseGraphArgs(args: []const []const u8, errorStr: *[]const u8) !GraphArgs {
+    if (args.len == 0) {
+        errorStr.* = "No args given to 'graph'. needed a .graph file!";
+        return error.MissingArgument;
+    }
+
+    var ret: GraphArgs = .{
+        .file = args[0],
+        .outputType = .human,
+    };
+
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--out=bare")) {
+            ret.outputType = .bare;
+        }
+        if (std.mem.eql(u8, arg, "--out=human")) {
+            ret.outputType = .human;
+        }
+        if (std.mem.eql(u8, arg, "--out=none")) {
+            ret.outputType = .none;
+        }
+    }
+
+    return ret;
+}
+
+fn maxStackUsage(bytecode: *bc.BytecodeInterpreter, graphs: *const graph.Graphs) !u32 {
+    var max: u32 = 1;
+    for (graphs.graph) |g| {
+        max = @max(max, try bytecode.getMaxStackUsage(g.filter.left.value));
+        max = @max(max, try bytecode.getMaxStackUsage(g.filter.right.value));
+        max = @max(max, try bytecode.getMaxStackUsage(g.x.value));
+        for (g.y) |axis| {
+            max = @max(max, try bytecode.getMaxStackUsage(axis.value));
+        }
+        max = @max(max, try bytecode.getMaxStackUsage(g.annotation.line));
+        max = @max(max, try bytecode.getMaxStackUsage(g.annotation.x));
+        max = @max(max, try bytecode.getMaxStackUsage(g.annotation.y));
+        max = @max(max, try bytecode.getMaxStackUsage(g.annotation.value));
+    }
+    return max;
+}
+
+pub fn doGraph(
+    io: Io,
+    gpa: Allocator,
+    pageAlloc: Allocator,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    args: []const []const u8,
+) !void {
+    var errorStr: []const u8 = "";
+    const subArgs = if (args.len >= 3) args[2..] else &.{};
+    const graphArgs = parseGraphArgs(subArgs, &errorStr) catch |e| {
+        try stdout.print("Error from 'graph' subcommand!\n  {s}\n", .{errorStr});
+        return e;
+    };
+
+    const graphContents = try f.readFileToString(io, graphArgs.file, pageAlloc);
+    defer pageAlloc.free(graphContents);
+
+    var diagnostic: f.Diagnostic = .{
+        .gpa = gpa,
+        .extraRefs = .empty,
+        .filename = graphArgs.file,
+        .message = &.{},
+        .from = .from(""),
+    };
+    defer diagnostic.deinit();
+
+    errdefer {
+        if (diagnostic.message.len != 0) {
+            diagnostic.print(stderr, graphContents) catch {};
+            stderr.flush() catch {};
+        }
+    }
+
+    var parser: parse.ParserPass1 = .{
+        .bytecodeStream = .{
+            .arr = .empty,
+        },
+        .keyrefTable = .empty,
+        .scope = .empty,
+        .lexer = .init(graphContents),
+        .paramNames = .empty,
+        .bytecodeStarts = .empty,
+    };
+    parser.paramNames = .initBuffer(&parser.paramNameBuf);
+    defer parser.deinit(gpa);
+
+    var parsed = try parser.pass(gpa, graph.Graphs, &diagnostic);
+    defer graph.deinit(gpa, &parsed);
+
+    var cache: bc.ValueCache = .init();
+    defer cache.deinit(gpa);
+
+    var dummyStack: [1]f32 = undefined;
+    var bytecode: bc.BytecodeInterpreter = .{
+        .keyrefNames = parser.keyrefTable.items,
+        .reader = .{
+            .bytecode = parser.bytecodeStream.arr.items,
+            .pos = 0,
+        },
+        .stackAllocator = .failing,
+        .valueStack = .initBuffer(&dummyStack),
+        .datastoreAllocator = gpa,
+        .store = .{
+            .maxFrame = 0,
+            .leftFrame = .nil,
+            .rightFrame = .nil,
+            .frames = &.{},
+            .cache = &cache,
+        },
+    };
+
+    const stackSize: usize = @max(try maxStackUsage(&bytecode, &parsed), 8);
+    const stack = try gpa.alloc(f32, stackSize);
+    defer gpa.free(stack);
+    bytecode.valueStack = .initBuffer(stack);
+
+    try graph.run(
+        io,
+        gpa,
+        pageAlloc,
+        &parsed,
+        stdout,
+        &bytecode,
+        graphArgs.outputType,
+    );
 }
 
 pub fn resultsOf(
@@ -134,9 +270,11 @@ pub fn doParse(
 
     var stackBuffer: [6]f32 = undefined;
 
-    var pass2 = try parser.pass(gpa, &diagnostic);
+    var parsed = try parser.pass(gpa, graph.Graphs, &diagnostic);
+    defer graph.deinit(gpa, &parsed);
 
     var bytecode: bc.BytecodeInterpreter = .{
+        .keyrefNames = parser.keyrefTable.items,
         .reader = .{
             .bytecode = parser.bytecodeStream.arr.items,
             .pos = 0,
@@ -159,7 +297,7 @@ pub fn doParse(
         }
     }
 
-    _ = &pass2;
+    _ = &parsed;
 
     _ = try stdout.write("");
 }
@@ -445,7 +583,12 @@ pub fn cool(
 
     var stackBuffer: [6]f32 = undefined;
 
+    const keyrefNames = try gpa.alloc([]const u8, cols.len);
+    defer gpa.free(keyrefNames);
+    for (cols, 0..) |c, i| keyrefNames[i] = c.name;
+
     var bytecode: bc.BytecodeInterpreter = .{
+        .keyrefNames = keyrefNames,
         .reader = .{
             .bytecode = builder.arr.items,
             .pos = 0,
@@ -503,6 +646,9 @@ pub fn main(init: std.process.Init) !void {
         try stdout.flush();
     } else if (std.mem.eql(u8, subcommand, "parse")) {
         try doParse(io, init.gpa, std.heap.page_allocator, stdout, stderr, args);
+        try stdout.flush();
+    } else if (std.mem.eql(u8, subcommand, "graph")) {
+        try doGraph(io, init.gpa, std.heap.page_allocator, stdout, stderr, args);
         try stdout.flush();
     } else if (std.mem.eql(u8, subcommand, "list_keys")) {
         try listKeys(io, init.gpa, std.heap.page_allocator, stdout, args);

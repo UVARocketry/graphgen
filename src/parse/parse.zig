@@ -1,5 +1,6 @@
 const lex = @import("lexer.zig");
 const bc = @import("bytecode.zig");
+const types = @import("types.zig");
 const std = @import("std");
 const files = @import("../fileref.zig");
 const Diagnostic = files.Diagnostic;
@@ -109,6 +110,9 @@ pub const Pass1Error = error{
     KeywordAsIdentifier,
     AlreadyDefined,
     UnexpectedToken,
+    TypeMismatch,
+    UnknownField,
+    MissingField,
 } || lex.LexerError;
 
 const ParseContext = enum {
@@ -212,18 +216,248 @@ pub const ParserPass1 = struct {
         return @intCast(self.scope.items.len - 1);
     }
 
-    pub fn parseObject(self: *Parser, alloc: Allocator, diagnostic: *Diagnostic) Pass1Error!void {
+    fn fieldCount(comptime T: type) usize {
+        return @typeInfo(T).@"struct".field_names.len;
+    }
+
+    fn isSlice(comptime T: type) bool {
+        if (comptime T == []const u8) return false;
+        return switch (@typeInfo(T)) {
+            .pointer => |p| p.size == .slice,
+            else => false,
+        };
+    }
+
+    fn isBytecode(comptime T: type) bool {
+        return comptime blk: {
+            switch (@typeInfo(T)) {
+                .@"struct" => {
+                    if (!@hasDecl(T, "special")) break :blk false;
+                    break :blk T.special == types.SpecialTypes.bytecode;
+                },
+                else => break :blk false,
+            }
+        };
+    }
+
+    fn hasRestrictions(comptime T: type) bool {
+        return comptime blk: {
+            switch (@typeInfo(T)) {
+                .@"struct" => break :blk @hasDecl(T, "restrictions"),
+                else => break :blk false,
+            }
+        };
+    }
+
+    /// Builds a struct with one `ArrayListUnmanaged` per slice field of `T`,
+    /// named after the field it accumulates.
+    fn SliceLists(comptime T: type) type {
+        const info = @typeInfo(T).@"struct";
+        comptime var names: []const []const u8 = &.{};
+        comptime var fieldTypes: []const type = &.{};
+        inline for (info.field_names, info.field_types) |name, FT| {
+            if (isSlice(FT)) {
+                const Elem = @typeInfo(FT).pointer.child;
+                names = names ++ &[_][]const u8{name};
+                fieldTypes = fieldTypes ++ &[_]type{std.ArrayListUnmanaged(Elem)};
+            }
+        }
+        return @Struct(.auto, null, names, fieldTypes, &@splat(.{}));
+    }
+
+    fn setBytecodeHandle(comptime T: type, value: *T, comptime name: []const u8, int: u16) void {
+        const Handle = @FieldType(T, name);
+        switch (@typeInfo(Handle)) {
+            .int => @field(value.*, name) = @intCast(int),
+            .@"enum" => @field(value.*, name) = @fromBackingInt(@intCast(int)),
+            else => @compileError("bytecode field '" ++ name ++ "' must be an integer or an enum"),
+        }
+    }
+
+    fn makeBytecode(comptime T: type, ref: bc.BytecodeRef) T {
+        var value: T = undefined;
+        setBytecodeHandle(T, &value, "start", ref.start);
+        setBytecodeHandle(T, &value, "len", ref.len);
+        return value;
+    }
+
+    fn bytecodeHandleInt(comptime T: type, value: T, comptime name: []const u8) u16 {
+        const Handle = @FieldType(T, name);
+        return switch (@typeInfo(Handle)) {
+            .int => @intCast(@field(value, name)),
+            .@"enum" => @intCast(@backingInt(@field(value, name))),
+            else => @compileError("bytecode field '" ++ name ++ "' must be an integer or an enum"),
+        };
+    }
+
+    fn bytecodeRefOf(comptime T: type, value: T) bc.BytecodeRef {
+        return .{
+            .start = bytecodeHandleInt(T, value, "start"),
+            .len = bytecodeHandleInt(T, value, "len"),
+        };
+    }
+
+    fn expectedValueError(
+        self: *Parser,
+        comptime expected: []const u8,
+        keyRef: files.FileRef,
+        diagnostic: *Diagnostic,
+    ) Pass1Error!void {
+        var w = diagnostic.writer();
+        defer w.deinit();
+        try w.writer.print(
+            "parse error: expected {s} for key '{s}', instead got '{s}'",
+            .{ expected, keyRef.str, self.lexer.currentTokenString },
+        );
+        diagnostic.message = try w.toOwnedSlice();
+        diagnostic.from = .from(self.lexer.currentTokenString);
+        try diagnostic.addRef(.{
+            .staticMessage = "while parsing key",
+            .ref = keyRef,
+        });
+    }
+
+    fn restrictionError(
+        self: *Parser,
+        comptime what: []const u8,
+        keyRef: files.FileRef,
+        diagnostic: *Diagnostic,
+    ) Pass1Error!void {
+        var w = diagnostic.writer();
+        defer w.deinit();
+        try w.writer.print(
+            "type error: a value for key '{s}' may not contain {s}",
+            .{ keyRef.str, what },
+        );
+        diagnostic.message = try w.toOwnedSlice();
+        diagnostic.from = .from(self.lexer.currentTokenString);
+        try diagnostic.addRef(.{
+            .staticMessage = "while parsing key",
+            .ref = keyRef,
+        });
+    }
+
+    /// Checks that the bytecode of a `Bytecode(...)` field only uses the
+    /// reference kinds its `restrictions` allow.
+    fn checkBytecodeRestrictions(
+        self: *Parser,
+        comptime T: type,
+        ref: bc.BytecodeRef,
+        keyRef: files.FileRef,
+        diagnostic: *Diagnostic,
+    ) Pass1Error!void {
+        if (comptime hasRestrictions(T)) {
+            const R = T.restrictions;
+            var reader: bc.BytecodeReader = .{
+                .bytecode = self.bytecodeStream.arr.items,
+                .pos = ref.start,
+            };
+            const end: u32 = @as(u32, ref.start) + ref.len;
+            while (reader.pos < end) {
+                const op = reader.eatOp();
+                if (op.isKeyref) {
+                    switch (op.rest.keyref.tp) {
+                        .keyref => if (!R.keyrefs) {
+                            try self.restrictionError("keyrefs", keyRef, diagnostic);
+                            return error.TypeMismatch;
+                        },
+                        .axis => if (!R.axisrefs) {
+                            try self.restrictionError("axis references", keyRef, diagnostic);
+                            return error.TypeMismatch;
+                        },
+                        .value, .fn_arg => {},
+                    }
+                    reader.pos += bc.BytecodeReader.getTypeSizeForPush(op.rest.keyref.tp);
+                } else {
+                    switch (op.rest.operation) {
+                        .call => _ = reader.eatType(bc.BytecodeOp.OpTypes.FnCallArgs),
+                        else => {},
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn parseObject(
+        self: *Parser,
+        alloc: Allocator,
+        comptime T: type,
+        diagnostic: *Diagnostic,
+    ) Pass1Error!T {
+        return self.parseStructBody(alloc, T, false, diagnostic);
+    }
+
+    fn parseStructBody(
+        self: *Parser,
+        alloc: Allocator,
+        comptime T: type,
+        comptime topLevel: bool,
+        diagnostic: *Diagnostic,
+    ) Pass1Error!T {
+        var value: T = undefined;
+        var set: [fieldCount(T)]bool = @splat(false);
+
+        const Lists = SliceLists(T);
+        var lists: Lists = undefined;
+        inline for (@typeInfo(Lists).@"struct".field_names) |name| {
+            @field(lists, name) = .empty;
+        }
+        errdefer inline for (@typeInfo(Lists).@"struct".field_names) |name| {
+            @field(lists, name).deinit(alloc);
+        };
+
         var currentToken = try self.lexer.getNextToken(diagnostic);
-        while (currentToken != .eof) {
+        while (true) {
+            if (currentToken == .rbrace or currentToken == .eof) {
+                if (!topLevel and currentToken == .eof) {
+                    var w = diagnostic.writer();
+                    defer w.deinit();
+                    try w.writer.print(
+                        "parse error: Unexpected end of file, expected a '}}' to close the object",
+                        .{},
+                    );
+                    diagnostic.message = try w.toOwnedSlice();
+                    diagnostic.from = .from(self.lexer.currentTokenString);
+                    return error.UnexpectedToken;
+                }
+                if (topLevel and currentToken == .rbrace) {
+                    var w = diagnostic.writer();
+                    defer w.deinit();
+                    try w.writer.print(
+                        "parse error: Unexpected '}}', there is no object to close here",
+                        .{},
+                    );
+                    diagnostic.message = try w.toOwnedSlice();
+                    diagnostic.from = .from(self.lexer.currentTokenString);
+                    return error.UnexpectedToken;
+                }
+                break;
+            }
+            if (currentToken == .newline) {
+                currentToken = try self.lexer.getNextToken(diagnostic);
+                continue;
+            }
+
             switch (currentToken) {
                 .ident => {
-                    try self.parseValue(alloc, diagnostic);
+                    try self.parseStructPair(alloc, T, &value, &set, &lists, diagnostic);
                 },
-                .newline => {
-                    currentToken = try self.lexer.getNextToken(diagnostic);
-                    continue;
+                .kwd_fn => {
+                    if (!topLevel) {
+                        var w = diagnostic.writer();
+                        defer w.deinit();
+                        try w.writer.print(
+                            \\parse error: Expected an identifier for an object key, instead got the keyword '{s}'
+                            \\  NOTE: keywords cannot be used as identifiers
+                        ,
+                            .{self.lexer.currentTokenString},
+                        );
+                        diagnostic.message = try w.toOwnedSlice();
+                        diagnostic.from = .from(self.lexer.currentTokenString);
+                        return error.KeywordAsIdentifier;
+                    }
+                    try self.parseFunctionDefinition(alloc, diagnostic);
                 },
-                .rbrace => return,
                 else => {
                     const name = @tagName(currentToken);
                     if (std.mem.startsWith(u8, name, "kwd_")) {
@@ -252,11 +486,9 @@ pub const ParserPass1 = struct {
                     return error.UnexpectedToken;
                 },
             }
+
             currentToken = try self.lexer.getNextToken(diagnostic);
-            if (currentToken == .rbrace) {
-                return;
-            }
-            if (currentToken != .newline and currentToken != .eof) {
+            if (currentToken != .newline and currentToken != .rbrace and currentToken != .eof) {
                 var w = diagnostic.writer();
                 defer w.deinit();
                 try w.writer.print(
@@ -267,7 +499,148 @@ pub const ParserPass1 = struct {
                 diagnostic.from = .from(self.lexer.currentTokenString);
                 return error.MissingEndOfStatement;
             }
-            currentToken = try self.lexer.getNextToken(diagnostic);
+        }
+
+        const info = @typeInfo(T).@"struct";
+        inline for (info.field_names, info.field_types, info.field_attrs, 0..) |name, FT, attrs, i| {
+            if (comptime isSlice(FT)) {
+                @field(value, name) = try @field(lists, name).toOwnedSlice(alloc);
+            } else if (set[i]) {
+                // parsed above
+            } else if (attrs.defaultValue(FT)) |default| {
+                @field(value, name) = default;
+            } else {
+                var w = diagnostic.writer();
+                defer w.deinit();
+                try w.writer.print(
+                    "parse error: missing required key '{s}'",
+                    .{name},
+                );
+                diagnostic.message = try w.toOwnedSlice();
+                diagnostic.from = .from(name);
+                return error.MissingField;
+            }
+        }
+
+        return value;
+    }
+
+    fn parseStructPair(
+        self: *Parser,
+        alloc: Allocator,
+        comptime T: type,
+        value: *T,
+        set: *[fieldCount(T)]bool,
+        lists: *SliceLists(T),
+        diagnostic: *Diagnostic,
+    ) Pass1Error!void {
+        const keyName = self.lexer.currentTokenString;
+        const keyRef: files.FileRef = .from(keyName);
+        const info = @typeInfo(T).@"struct";
+
+        var matched = false;
+        inline for (info.field_names, info.field_types, 0..) |name, FT, i| {
+            if (!matched and std.mem.eql(u8, name, keyName)) {
+                matched = true;
+                try self.parseStructField(
+                    alloc,
+                    T,
+                    name,
+                    FT,
+                    i,
+                    keyRef,
+                    value,
+                    set,
+                    lists,
+                    diagnostic,
+                );
+            }
+        }
+
+        if (!matched) {
+            var w = diagnostic.writer();
+            defer w.deinit();
+            try w.writer.print(
+                "parse error: Unknown key '{s}' for type '{s}'",
+                .{ keyName, @typeName(T) },
+            );
+            diagnostic.message = try w.toOwnedSlice();
+            diagnostic.from = keyRef;
+            return error.UnknownField;
+        }
+    }
+
+    fn parseStructField(
+        self: *Parser,
+        alloc: Allocator,
+        comptime T: type,
+        comptime name: []const u8,
+        comptime FT: type,
+        comptime index: usize,
+        keyRef: files.FileRef,
+        value: *T,
+        set: *[fieldCount(T)]bool,
+        lists: *SliceLists(T),
+        diagnostic: *Diagnostic,
+    ) Pass1Error!void {
+        const next = try self.lexer.peekNextToken(diagnostic);
+        var labelName: ?[]const u8 = null;
+        if (next.tp == .valuerefdecl) {
+            _ = try self.lexer.getNextToken(diagnostic);
+            labelName = self.lexer.currentString.?;
+        }
+
+        if (comptime isSlice(FT)) {
+            if (labelName != null) {
+                try self.expectedValueError("a list to be named", keyRef, diagnostic);
+                return error.TypeMismatch;
+            }
+            const Elem = @typeInfo(FT).pointer.child;
+            const item = try self.parseValue(alloc, Elem, keyRef, diagnostic);
+            try @field(lists, name).append(alloc, item);
+            return;
+        }
+
+        if (set[index]) {
+            var w = diagnostic.writer();
+            defer w.deinit();
+            try w.writer.print(
+                "parse error: key '{s}' was already given a value",
+                .{keyRef.str},
+            );
+            diagnostic.message = try w.toOwnedSlice();
+            diagnostic.from = keyRef;
+            return error.AlreadyDefined;
+        }
+
+        const parsed = try self.parseValue(alloc, FT, keyRef, diagnostic);
+        @field(value.*, name) = parsed;
+        set[index] = true;
+
+        if (labelName) |lname| {
+            if (comptime !isBytecode(FT)) {
+                var w = diagnostic.writer();
+                defer w.deinit();
+                try w.writer.print(
+                    "parse error: key '{s}' cannot be named with '#{s}' because it is not an interpreted value",
+                    .{ keyRef.str, lname },
+                );
+                diagnostic.message = try w.toOwnedSlice();
+                diagnostic.from = .from(lname);
+                try diagnostic.addRef(.{
+                    .staticMessage = "while parsing key",
+                    .ref = keyRef,
+                });
+                return error.TypeMismatch;
+            }
+            const scopeIndex = try self.defineScopeItem(
+                alloc,
+                lname,
+                .valueref,
+                .from(lname),
+                diagnostic,
+            );
+            self.scope.items[scopeIndex].bytecodeRef = bytecodeRefOf(FT, parsed);
         }
     }
 
@@ -760,128 +1133,149 @@ pub const ParserPass1 = struct {
         );
     }
 
-    pub fn parseValue(self: *Parser, alloc: Allocator, diagnostic: *Diagnostic) Pass1Error!void {
-        const identName = self.lexer.currentTokenString;
-
-        const maybeValueRef = try self.lexer.peekNextToken(diagnostic);
-        const scopeIndex =
-            if (maybeValueRef.tp == .valuerefdecl) blk: {
-                _ = try self.lexer.getNextToken(diagnostic);
-                break :blk try self.defineScopeItem(
-                    alloc,
-                    self.lexer.currentString.?,
-                    .valueref,
-                    .from(self.lexer.currentTokenString),
-                    diagnostic,
-                );
-            } else null;
-
-        const token = try self.lexer.getNextToken(diagnostic);
-        var bytecodeRef: ?bc.BytecodeRef = null;
-        switch (token) {
-            .string => {},
-            .op_minus => {
-                const minusStr = self.lexer.currentTokenString;
-                const num = try self.lexer.getNextToken(diagnostic);
-                if (num != .number) {
-                    var w = diagnostic.writer();
-                    defer w.deinit();
-
-                    try w.writer.print(
-                        "parse error: Unexpected token '{s}'. Expected a number after a '-' (eg -0.8)",
-                        .{
-                            self.lexer.currentTokenString,
-                        },
-                    );
-                    diagnostic.message = try w.toOwnedSlice();
-                    diagnostic.from = .from(self.lexer.currentTokenString);
-                    try diagnostic.addRef(.{
-                        .staticMessage = "after",
-                        .ref = .from(minusStr),
-                    });
-                    return error.UnexpectedToken;
-                }
-            },
-            .lbrace => {
-                try self.parseObject(alloc, diagnostic);
-            },
-            .number => {},
-            .ident => {},
-            .nakedvalueref => {},
-            .op_eq => {
-                try self.bytecodeStarts.append(alloc, .{
-                    .start = @intCast(self.bytecodeStream.arr.items.len),
-                    .linemarker = .from(identName),
-                });
-                bytecodeRef = try self.parseBytecode(alloc, diagnostic);
-            },
-            else => {
-                if (maybeValueRef.tp == .valuerefdecl) {
-                    var w = diagnostic.writer();
-                    defer w.deinit();
-
-                    try w.writer.print(
-                        "parse error: Unexpected token '{s}'. Expected a string, left bracket (to start an object definition), identifier (for an enum value), a value reference ('!#name'), or an equals sign (to start an interpreted statement). ({t})",
-                        .{
-                            self.lexer.currentTokenString,
-                            token,
-                        },
-                    );
-                    diagnostic.message = try w.toOwnedSlice();
-                    diagnostic.from = .from(self.lexer.currentTokenString);
-                    try diagnostic.addRef(.{
-                        .staticMessage = "while parsing key",
-                        .ref = .from(identName),
-                    });
-                    return error.UnexpectedToken;
-                } else {
-                    var w = diagnostic.writer();
-                    defer w.deinit();
-
-                    try w.writer.print(
-                        "parse error: Unexpected token '{s}'. Expected a string, left bracket (to start an object definition), identifier (for an enum value), a value reference ('!#name'), an equals sign (to start an interpreted statement), or a value reference declaration ('#name') followed by one of the other listed tokens. ({t})",
-                        .{
-                            self.lexer.currentTokenString,
-                            token,
-                        },
-                    );
-                    diagnostic.message = try w.toOwnedSlice();
-                    diagnostic.from = .from(self.lexer.currentTokenString);
-                    try diagnostic.addRef(.{
-                        .staticMessage = "while parsing key",
-                        .ref = .from(identName),
-                    });
-                    return error.UnexpectedToken;
-                }
-            },
+    fn parseNumber(
+        self: *Parser,
+        comptime T: type,
+        keyRef: files.FileRef,
+        diagnostic: *Diagnostic,
+    ) Pass1Error!T {
+        var token = try self.lexer.getNextToken(diagnostic);
+        var negative = false;
+        if (token == .op_minus) {
+            negative = true;
+            token = try self.lexer.getNextToken(diagnostic);
         }
+        if (token != .number) {
+            try self.expectedValueError("a number", keyRef, diagnostic);
+            return error.TypeMismatch;
+        }
+        var number = self.lexer.currentNumber.?;
+        if (negative) number = -number;
+        return switch (@typeInfo(T)) {
+            .float => @floatCast(number),
+            .int => @intFromFloat(number),
+            else => unreachable,
+        };
+    }
 
-        if (scopeIndex) |i| {
-            if (bytecodeRef) |ref| {
-                self.scope.items[i].bytecodeRef = ref;
+    pub fn parseValue(
+        self: *Parser,
+        alloc: Allocator,
+        comptime T: type,
+        keyRef: files.FileRef,
+        diagnostic: *Diagnostic,
+    ) Pass1Error!T {
+        if (comptime isBytecode(T)) {
+            const next = try self.lexer.peekNextToken(diagnostic);
+            switch (next.tp) {
+                .op_eq => {
+                    _ = try self.lexer.getNextToken(diagnostic);
+                    try self.bytecodeStarts.append(alloc, .{
+                        .start = @intCast(self.bytecodeStream.arr.items.len),
+                        .linemarker = keyRef,
+                    });
+                    const ref = try self.parseBytecode(alloc, diagnostic);
+                    try self.checkBytecodeRestrictions(T, ref, keyRef, diagnostic);
+                    return makeBytecode(T, ref);
+                },
+                .nakedvalueref => {
+                    _ = try self.lexer.getNextToken(diagnostic);
+                    const name = self.lexer.currentString.?;
+                    const scopeIndex = self.findScopeItem(name, .valueref) orelse {
+                        var w = diagnostic.writer();
+                        defer w.deinit();
+                        try w.writer.print(
+                            "parse error: value reference '#{s}' is not defined",
+                            .{name},
+                        );
+                        diagnostic.message = try w.toOwnedSlice();
+                        diagnostic.from = .from(name);
+                        try diagnostic.addRef(.{
+                            .staticMessage = "while parsing key",
+                            .ref = keyRef,
+                        });
+                        return error.Undefined;
+                    };
+                    const ref = self.scope.items[scopeIndex].bytecodeRef orelse {
+                        var w = diagnostic.writer();
+                        defer w.deinit();
+                        try w.writer.print(
+                            "parse error: value reference '#{s}' is not a reference to bytecode",
+                            .{name},
+                        );
+                        diagnostic.message = try w.toOwnedSlice();
+                        diagnostic.from = .from(name);
+                        try diagnostic.addRef(.{
+                            .staticMessage = "while parsing key",
+                            .ref = keyRef,
+                        });
+                        return error.Undefined;
+                    };
+                    return makeBytecode(T, ref);
+                },
+                else => {
+                    try self.expectedValueError(
+                        "an equals sign (to start an interpreted statement) or a value reference ('!#name')",
+                        keyRef,
+                        diagnostic,
+                    );
+                    return error.TypeMismatch;
+                },
             }
         }
 
-        const next = try self.lexer.peekNextToken(diagnostic);
-        if (!next.tp.isEos()) {
-            var w = diagnostic.writer();
-            defer w.deinit();
-
-            try w.writer.print(
-                "parse error: Expected an end of statement (newline or end of file) after assigned value ({s}) for key '{s}', instead got '{s}'!",
-                .{
-                    self.lexer.currentTokenString,
-                    identName,
-                    next.currentTokenString,
-                },
-            );
-            diagnostic.message = try w.toOwnedSlice();
-            diagnostic.from = .from(next.currentTokenString);
-            try diagnostic.addRef(.{
-                .staticMessage = "while parsing key",
-                .ref = .from(identName),
-            });
-            return error.MissingEndOfStatement;
+        switch (@typeInfo(T)) {
+            .pointer => {
+                if (comptime T == []const u8) {
+                    const token = try self.lexer.getNextToken(diagnostic);
+                    if (token != .string) {
+                        try self.expectedValueError("a string", keyRef, diagnostic);
+                        return error.TypeMismatch;
+                    }
+                    return self.lexer.currentString.?;
+                }
+                @compileError("unsupported pointer type for a key value: " ++ @typeName(T));
+            },
+            .float, .int => return self.parseNumber(T, keyRef, diagnostic),
+            .@"enum" => {
+                const token = try self.lexer.getNextToken(diagnostic);
+                if (token != .ident) {
+                    try self.expectedValueError("an identifier", keyRef, diagnostic);
+                    return error.TypeMismatch;
+                }
+                const info = @typeInfo(T).@"enum";
+                inline for (info.field_names, info.field_values) |tagName, tagValue| {
+                    if (std.mem.eql(u8, tagName, self.lexer.currentTokenString)) {
+                        return @fromBackingInt(@intCast(tagValue));
+                    }
+                }
+                var w = diagnostic.writer();
+                defer w.deinit();
+                try w.writer.print(
+                    "parse error: unknown value '{s}' for key '{s}', expected one of ",
+                    .{ self.lexer.currentTokenString, keyRef.str },
+                );
+                try w.writer.print("'{s}'", .{info.field_names[0]});
+                inline for (info.field_names[1..]) |fieldName| {
+                    try w.writer.print(", '{s}'", .{fieldName});
+                }
+                diagnostic.message = try w.toOwnedSlice();
+                diagnostic.from = .from(self.lexer.currentTokenString);
+                try diagnostic.addRef(.{
+                    .staticMessage = "while parsing key",
+                    .ref = keyRef,
+                });
+                return error.TypeMismatch;
+            },
+            .@"struct" => {
+                const token = try self.lexer.getNextToken(diagnostic);
+                if (token != .lbrace) {
+                    try self.expectedValueError("an object (starting with '{')", keyRef, diagnostic);
+                    return error.TypeMismatch;
+                }
+                return self.parseObject(alloc, T, diagnostic);
+            },
+            else => @compileError("unsupported type for a key value: " ++ @typeName(T)),
         }
     }
 
@@ -1137,38 +1531,13 @@ pub const ParserPass1 = struct {
         unreachable;
     }
 
-    pub fn pass(self: *Parser, alloc: Allocator, diagnostic: *Diagnostic) Pass1Error!ParserPass2 {
-        var currentToken = try self.lexer.getNextToken(diagnostic);
-        while (currentToken != .eof) {
-            switch (currentToken) {
-                .ident => {
-                    try self.parseValue(alloc, diagnostic);
-                },
-                .kwd_fn => {
-                    try self.parseFunctionDefinition(alloc, diagnostic);
-                },
-                .kwd_import => unreachable,
-                .kwd_foreign => unreachable,
-                .newline => {
-                    currentToken = try self.lexer.getNextToken(diagnostic);
-                    continue;
-                },
-                else => unreachable,
-            }
-            currentToken = try self.lexer.getNextToken(diagnostic);
-            if (currentToken != .newline and currentToken != .eof) {
-                var w = diagnostic.writer();
-                defer w.deinit();
-                try w.writer.print(
-                    "parse error: Expected a newline after finishing a statement, instead got '{s}'",
-                    .{self.lexer.currentTokenString},
-                );
-                diagnostic.message = try w.toOwnedSlice();
-                diagnostic.from = .from(self.lexer.currentTokenString);
-                return error.MissingEndOfStatement;
-            }
-            currentToken = try self.lexer.getNextToken(diagnostic);
-        }
+    pub fn pass(
+        self: *Parser,
+        alloc: Allocator,
+        comptime T: type,
+        diagnostic: *Diagnostic,
+    ) Pass1Error!T {
+        const parsed = try self.parseStructBody(alloc, T, true, diagnostic);
 
         // pass to ensure that all valuerefs and functions were properly defined
         for (self.scope.items) |item| {
@@ -1200,8 +1569,8 @@ pub const ParserPass1 = struct {
                 switch (op.rest.keyref.tp) {
                     .axis => {
                         const argPos = reader.pos;
-                        const T = bc.BytecodeReader.GetTypeForPush(.axis);
-                        comptime std.debug.assert(T == bc.BytecodeRef);
+                        const AxisArg = bc.BytecodeReader.GetTypeForPush(.axis);
+                        comptime std.debug.assert(AxisArg == bc.BytecodeRef);
                         const args = reader.eatPushArgs(.axis);
 
                         const scopeId = args.start;
@@ -1256,7 +1625,7 @@ pub const ParserPass1 = struct {
             }
         }
 
-        return undefined;
+        return parsed;
     }
 };
 

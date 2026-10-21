@@ -344,8 +344,10 @@ pub const Lexer = struct {
 
         inline for (comptime std.meta.fieldNames(TokenType)) |field| {
             const signal = "kwd_";
-            if (field.len > signal.len and std.mem.eql(u8, word, field[signal.len..])) {
-                return @field(TokenType, field);
+            if (comptime std.mem.startsWith(u8, field, signal)) {
+                if (std.mem.eql(u8, word, field[signal.len..])) {
+                    return @field(TokenType, field);
+                }
             }
         }
 
