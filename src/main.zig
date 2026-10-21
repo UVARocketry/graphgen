@@ -88,10 +88,12 @@ fn maxStackUsage(bytecode: *bc.BytecodeInterpreter, graphs: *const graph.Graphs)
         for (g.y) |axis| {
             max = @max(max, try bytecode.getMaxStackUsage(axis.value));
         }
-        max = @max(max, try bytecode.getMaxStackUsage(g.annotation.line));
-        max = @max(max, try bytecode.getMaxStackUsage(g.annotation.x));
-        max = @max(max, try bytecode.getMaxStackUsage(g.annotation.y));
-        max = @max(max, try bytecode.getMaxStackUsage(g.annotation.value));
+        for (g.annotation) |annotation| {
+            max = @max(max, try bytecode.getMaxStackUsage(annotation.line));
+            max = @max(max, try bytecode.getMaxStackUsage(annotation.x));
+            max = @max(max, try bytecode.getMaxStackUsage(annotation.y));
+            max = @max(max, try bytecode.getMaxStackUsage(annotation.value));
+        }
     }
     return max;
 }

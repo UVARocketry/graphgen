@@ -88,3 +88,86 @@ test "typed parse" {
     try std.testing.expectEqual(@as(u16, 0), value.value.start);
     try std.testing.expect(value.value.len > 0);
 }
+
+test "multiple annotations" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\use "data"
+        \\graph {
+        \\  saveto "out"
+        \\  filter {
+        \\    left {
+        \\      value = .a
+        \\      hint none
+        \\    }
+        \\    right {
+        \\      value = .a
+        \\      hint none
+        \\    }
+        \\  }
+        \\  x {
+        \\    value = .a
+        \\    title "x"
+        \\  }
+        \\  y {
+        \\    value = .a
+        \\    title "y"
+        \\  }
+        \\  annotation {
+        \\    line = .a
+        \\    select max
+        \\    x = .a
+        \\    y = .a
+        \\    text "a"
+        \\    value = .a
+        \\    arrow {
+        \\      dx 0
+        \\      dy 0
+        \\    }
+        \\  }
+        \\  annotation {
+        \\    line = .a
+        \\    select min
+        \\    x = .a
+        \\    y = .a
+        \\    text "b"
+        \\    value = .a
+        \\    arrow {
+        \\      dx 0
+        \\      dy 0
+        \\    }
+        \\  }
+        \\}
+        \\
+    ;
+
+    var diagnostic: f.Diagnostic = .{
+        .gpa = gpa,
+        .extraRefs = .empty,
+        .filename = "test",
+        .message = &.{},
+        .from = .from(""),
+    };
+    defer diagnostic.deinit();
+
+    var parser: parse.ParserPass1 = .{
+        .lexer = .init(src),
+        .bytecodeStream = .{ .arr = .empty },
+        .scope = .empty,
+        .keyrefTable = .empty,
+        .paramNames = .empty,
+        .bytecodeStarts = .empty,
+    };
+    parser.paramNames = .initBuffer(&parser.paramNameBuf);
+    defer parser.deinit(gpa);
+
+    const value = try parser.pass(gpa, graph.Graphs, &diagnostic);
+    defer graph.deinit(gpa, &value);
+
+    try std.testing.expectEqual(@as(usize, 1), value.graph.len);
+    try std.testing.expectEqual(@as(usize, 2), value.graph[0].annotation.len);
+    try std.testing.expectEqualStrings("a", value.graph[0].annotation[0].text);
+    try std.testing.expectEqualStrings("b", value.graph[0].annotation[1].text);
+    try std.testing.expect(value.graph[0].annotation[0].select == .max);
+    try std.testing.expect(value.graph[0].annotation[1].select == .min);
+}

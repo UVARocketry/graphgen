@@ -47,19 +47,30 @@ pub const Graph = struct {
     filter: Filter,
     x: Axis,
     y: []Axis,
-    annotation: Annotation,
+    annotation: []Annotation,
 };
 
 /// Frees the slices allocated by the parser. String fields point into the
 /// source file and are not freed here.
 pub fn deinit(alloc: Allocator, graphs: *const Graphs) void {
-    for (graphs.graph) |graph| alloc.free(graph.y);
+    for (graphs.graph) |graph| {
+        alloc.free(graph.y);
+        alloc.free(graph.annotation);
+    }
     alloc.free(graphs.graph);
 }
 
 const FrameStat = struct {
     frame: i32 = -1,
     value: f32 = 0,
+};
+
+const AnnotationStats = struct {
+    first: FrameStat = .{},
+    last: FrameStat = .{},
+    max: FrameStat = .{},
+    min: FrameStat = .{},
+    hasLineData: bool = false,
 };
 
 /// Renders annotation text, replacing `{N}` with the value rounded to `N`
@@ -192,11 +203,9 @@ pub fn run(
             }
         }
 
-        var first: FrameStat = .{};
-        var last: FrameStat = .{};
-        var max: FrameStat = .{};
-        var min: FrameStat = .{};
-        var hasLineData = false;
+        const stats = try gpa.alloc(AnnotationStats, graph.annotation.len);
+        defer gpa.free(stats);
+        @memset(stats, .{});
 
         frames: for (frameStart..frameEnd) |frame| {
             const frameNo: u32 = @intCast(frame);
@@ -211,19 +220,20 @@ pub fn run(
                 frameData[i] = y;
             }
 
-            // track the frame the annotation selects from
-            const line = try bytecode.execRange(graph.annotation.line, frameNo);
-            if (!std.math.isNan(line)) {
-                const stat: FrameStat = .{ .frame = @intCast(frameNo), .value = line };
-                if (!hasLineData) {
-                    first = stat;
-                    max = stat;
-                    min = stat;
+            // track the frame each annotation selects from
+            for (graph.annotation, stats) |annotation, *stat| {
+                const line = try bytecode.execRange(annotation.line, frameNo);
+                if (std.math.isNan(line)) continue;
+                const current: FrameStat = .{ .frame = @intCast(frameNo), .value = line };
+                if (!stat.hasLineData) {
+                    stat.first = current;
+                    stat.max = current;
+                    stat.min = current;
                 }
-                last = stat;
-                if (line > max.value) max = stat;
-                if (line < min.value) min = stat;
-                hasLineData = true;
+                stat.last = current;
+                if (line > stat.max.value) stat.max = current;
+                if (line < stat.min.value) stat.min = current;
+                stat.hasLineData = true;
             }
 
             for (0..graph.y.len + 1) |i| {
@@ -247,44 +257,51 @@ pub fn run(
             }
         }
 
-        try writer.print("ANNOTATIONS\n{}\n", .{@as(u32, 1)});
+        switch (outputType) {
+            .bare, .human => {
+                try writer.print("ANNOTATIONS\n{}\n", .{graph.annotation.len});
 
-        const frame: i32 = switch (graph.annotation.select) {
-            .first => first.frame,
-            .last => last.frame,
-            .max => max.frame,
-            .min => min.frame,
-        };
+                for (graph.annotation, stats) |annotation, stat| {
+                    const frame: i32 = switch (annotation.select) {
+                        .first => stat.first.frame,
+                        .last => stat.last.frame,
+                        .max => stat.max.frame,
+                        .min => stat.min.frame,
+                    };
 
-        if (frame < 0) {
-            try writer.print("SKIP\n", .{});
-        } else blk: {
-            const selectedFrame: u32 = @intCast(frame);
+                    if (frame < 0) {
+                        try writer.print("SKIP\n", .{});
+                        continue;
+                    }
+                    const selectedFrame: u32 = @intCast(frame);
 
-            const x = try bytecode.execRange(graph.annotation.x, selectedFrame);
-            if (std.math.isNan(x)) {
-                try writer.print("SKIP\n", .{});
-                break :blk;
-            }
-            const y = try bytecode.execRange(graph.annotation.y, selectedFrame);
-            if (std.math.isNan(y)) {
-                try writer.print("SKIP\n", .{});
-                break :blk;
-            }
-            const value = try bytecode.execRange(graph.annotation.value, selectedFrame);
-            if (std.math.isNan(value)) {
-                try writer.print("SKIP\n", .{});
-                break :blk;
-            }
+                    const x = try bytecode.execRange(annotation.x, selectedFrame);
+                    if (std.math.isNan(x)) {
+                        try writer.print("SKIP\n", .{});
+                        continue;
+                    }
+                    const y = try bytecode.execRange(annotation.y, selectedFrame);
+                    if (std.math.isNan(y)) {
+                        try writer.print("SKIP\n", .{});
+                        continue;
+                    }
+                    const value = try bytecode.execRange(annotation.value, selectedFrame);
+                    if (std.math.isNan(value)) {
+                        try writer.print("SKIP\n", .{});
+                        continue;
+                    }
 
-            try writer.print("x:{}\n", .{x});
-            try writer.print("y:{}\n", .{y});
-            try writer.print("text:\nBEGIN\n", .{});
-            try writeAnnotationText(writer, graph.annotation.text, value);
-            try writer.print("\nEND\n", .{});
-            try writer.print("type:text\n", .{});
-            try writer.print("arrow.dx:{}\n", .{graph.annotation.arrow.dx});
-            try writer.print("arrow.dy:{}\n", .{graph.annotation.arrow.dy});
+                    try writer.print("x:{}\n", .{x});
+                    try writer.print("y:{}\n", .{y});
+                    try writer.print("text:\nBEGIN\n", .{});
+                    try writeAnnotationText(writer, annotation.text, value);
+                    try writer.print("\nEND\n", .{});
+                    try writer.print("type:text\n", .{});
+                    try writer.print("arrow.dx:{}\n", .{annotation.arrow.dx});
+                    try writer.print("arrow.dy:{}\n", .{annotation.arrow.dy});
+                }
+            },
+            .none => {},
         }
 
         switch (outputType) {

@@ -257,12 +257,24 @@ graph {
             dy -100
         }
     }
+    annotation {
+        line !#z
+        select first
+        x !#x
+        y !#z
+        text "First value: {2} ft"
+        value = #z
+        arrow {
+            dx 5
+            dy 100
+        }
+    }
 }
 ```
 
-All of `saveto`, `filter`, `x`, `y`, and `annotation` are required; `annotation` is
-currently always emitted (there is no zero-annotation form). `y` is a repeated key
-that accumulates into a slice, so it can appear any number of times.
+`saveto`, `filter`, and `x` are required. `y` and `annotation` are repeated keys that
+accumulate into slices: both may appear any number of times (including zero), and
+each `annotation` block produces one annotation in the output.
 
 Filter sections:
 
@@ -285,6 +297,9 @@ Axes:
 
 Annotations:
 
+Each `annotation` block has the following fields and is evaluated independently
+against the same filtered frames:
+
 - `line`: bytecode evaluated every frame to find candidates and to decide whether
   data exists at all.
 - `select`: `first`, `last`, `min`, or `max` of the `line` values over the emitted
@@ -295,8 +310,8 @@ Annotations:
   places. `{}` formats without rounding. Escaping literal braces is not supported.
 - `arrow.dx` / `arrow.dy`: offset from the annotation point to the text.
 
-If the selected frame or any annotation component is NaN, the annotation is
-replaced by `SKIP`.
+If the selected frame or any component of an annotation is NaN, that annotation is
+replaced by `SKIP`; the other annotations are still emitted.
 
 ## Typed parser
 
@@ -365,8 +380,8 @@ The graph backend runs:
 2. keep referenced columns and compute `maxFrame`,
 3. remap keyrefs,
 4. resolve filter bounds,
-5. for each frame in the window, evaluate x, every y, and the annotation `line`,
-6. emit frames and the selected annotation.
+5. for each frame in the window, evaluate x, every y, and each annotation `line`,
+6. emit frames and each selected annotation.
 
 ## Output format
 
@@ -417,8 +432,9 @@ arrow.dy:<dy>
 END
 ```
 
-or just `SKIP\nEND\n` when no annotation could be produced. `--out=none` suppresses
-all chart/annotation output while still parsing data and executing expressions.
+If one annotation cannot be produced, its block is just `SKIP\n`; the remaining
+annotations are still emitted. `--out=none` suppresses all chart and annotation
+output while still parsing data and executing frame expressions.
 
 ## Python wrapper (`debuggraph2.py`)
 
@@ -461,7 +477,8 @@ debug_out_v2_small.txt     example v2 data file
 - Strings have no escapes and cannot span lines.
 - Keyword names are reserved.
 - `import`/`foreign` syntax is reserved in the grammar but not implemented.
-- The `.graph` backend currently emits exactly one annotation per graph.
+- The `.graph` backend emits one annotation per `annotation` block; each block
+  tracks its own `line` values independently.
 - Bare output uses native float byte order.
 
 ## Future ideas
