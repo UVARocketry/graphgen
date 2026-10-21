@@ -1,0 +1,548 @@
+[
+	{
+		"read": "./debug_out_v2_small.txt",
+		"out": "./plots/kalmanVel.png",
+		"font": {
+			"title": 32,
+			"xlabel": 20,
+			"ylabel": 20,
+			"legend": 20,
+			"tick": 16
+		},
+		"width": 15,
+		"height": 8,
+		"dpi": 100,
+		"filter": {
+			"left": {
+				"key": ".timestamp_s",
+				"convert": ["ge 3800"],
+				"hint": "monotonic"
+			},
+			"right": {
+				"key": ".worldSpace.acc_mps2.z",
+				"convert": ["ge -80"],
+				"hint": "spike"
+			}
+		},
+		"annotations": [],
+		"x": {
+			"key": ".timestamp_s",
+			"title": "timestamp (s)",
+			"convert": []
+		},
+		"y": [
+			{
+				"key": ".kalmanVel_mps.z",
+				"title": "kalman vel z",
+				"convert": []
+			},
+			{
+				"key": ".worldSpace.acc_mps2.z",
+				"title": "drag acc z",
+				"convert": []
+			},
+			{
+				"key": ".realAcc_mps2.z",
+				"title": "real acc z",
+				"convert": []
+			}
+		]
+	},
+	{
+		"read": "./debug_out_v2_small.txt",
+		"out": "./plots/accels.png",
+		"font": {
+			"title": 32,
+			"xlabel": 20,
+			"ylabel": 20,
+			"legend": 20,
+			"tick": 16
+		},
+		"width": 15,
+		"height": 8,
+		"dpi": 100,
+		"filter": {
+			"left": {
+				"key": ".timestamp_s",
+				"convert": ["ge 3800"],
+				"hint": "monotonic"
+			},
+			"right": {
+				"key": ".worldSpace.acc_mps2.z",
+				"convert": ["ge -80"],
+				"hint": "spike"
+			}
+		},
+		"annotations": [],
+		"x": {
+			"key": ".timestamp_s",
+			"title": "timestamp (s)",
+			"convert": []
+		},
+		"y": [
+			{
+				"key": ".realAcc_mps2.x",
+				"title": "real acc x",
+				"convert": []
+			},
+			{
+				"key": ".realAcc_mps2.y",
+				"title": "real acc y",
+				"convert": []
+			},
+			{
+				"key": ".realAcc_mps2.z",
+				"title": "real acc z",
+				"convert": []
+			},
+			{
+				"key": ".worldSpace.acc_mps2.x",
+				"title": "world acc x",
+				"convert": []
+			},
+			{
+				"key": ".worldSpace.acc_mps2.y",
+				"title": "world acc y",
+				"convert": []
+			},
+			{
+				"key": ".worldSpace.acc_mps2.z",
+				"title": "world acc z",
+				"convert": []
+			}
+		]
+	},
+	{
+		"read": "./debug_out_v2_small.txt",
+		"out": "./plots/kalmanPos.png",
+		"font": {
+			"title": 32,
+			"xlabel": 20,
+			"ylabel": 20,
+			"legend": 20,
+			"tick": 16
+		},
+		"width": 15,
+		"height": 8,
+		"dpi": 100,
+		"annotations": [
+			{
+				"type": "text",
+				"line": 0,
+				"select": "max",
+				"x": {
+					"value": "x:@",
+					"convert": []
+				},
+				"y": {
+					"value": "y[#]:@",
+					"convert": []
+				},
+				"text": "Final apogee: {1} ft",
+				"values": [
+					{
+						"value": "y[#]:@",
+						"convert": []
+					}
+				],
+				"arrow": {
+					"dx": -5,
+					"dy": -2000
+				},
+				"style": {
+					"bbox": {
+						"boxstyle": "round,pad=0.3",
+						"facecolor": "white",
+						"alpha": 0.8
+					},
+					"fontsize": 15,
+					"color": "green"
+				}
+			},
+			{
+				"type": "text",
+				"line": 1,
+				"select": "max",
+				"x": {
+					"value": "x:@",
+					"convert": []
+				},
+				"y": {
+					"value": "y[#]:@",
+					"convert": []
+				},
+				"text": "Lower bound max: {1} ft (err: {1} ft)",
+				"values": [
+					{
+						"value": "y[#]:@",
+						"convert": []
+					},
+					{
+						"value": "y[#]:@",
+						"convert": ["-y[0]:max", "ge 0"]
+					}
+				],
+				"arrow": {
+					"dx": -4,
+					"dy": -1000
+				},
+				"style": {
+					"bbox": {
+						"boxstyle": "round,pad=0.3",
+						"facecolor": "white",
+						"alpha": 0.8
+					},
+					"fontsize": 12,
+					"color": "red"
+				}
+			},
+			{
+				"type": "text",
+				"line": 2,
+				"select": "min",
+				"x": {
+					"value": "x:@",
+					"convert": []
+				},
+				"y": {
+					"value": "y[#]:@",
+					"convert": []
+				},
+				"text": "Upper bound min: {1} ft (err: {1} ft)",
+				"values": [
+					{
+						"value": "y[#]:@",
+						"convert": []
+					},
+					{
+						"value": "y[#]:@",
+						"convert": ["-y[0]:max", "*-1", "ge 0"]
+					}
+				],
+				"arrow": {
+					"dx": -3,
+					"dy": -1000
+				},
+				"style": {
+					"bbox": {
+						"boxstyle": "round,pad=0.3",
+						"facecolor": "white",
+						"alpha": 0.8
+					},
+					"fontsize": 12,
+					"color": "red"
+				}
+			}
+		],
+		"filter": {
+			"left": {
+				"key": ".timestamp_s",
+				"convert": ["ge 3800"],
+				"hint": "monotonic"
+			},
+			"right": {
+				"key": ".worldSpace.acc_mps2.z",
+				"convert": ["ge -80"],
+				"hint": "spike"
+			}
+		},
+		"x": {
+			"key": ".timestamp_s",
+			"title": "timestamp (s)",
+			"convert": []
+		},
+		"y": [
+			{
+				"key": ".kalmanPosZ_m_agl",
+				"title": "kalman pos z",
+				"convert": ["m_to_ft"]
+			},
+			{
+				"key": ".lowerBound_m_agl",
+				"title": "apogee bound lower",
+				"convert": ["m_to_ft"]
+			},
+			{
+				"key": ".upperBound_m_agl",
+				"title": "apogee bound upper",
+				"convert": ["m_to_ft"]
+			},
+			{
+				"key": ".timestamp_s",
+				"title": "real apogee",
+				"convert": [
+					"-.timestamp_s",
+					"+.kalmanPosZ_m_agl:last",
+					"m_to_ft"
+				]
+			}
+		]
+	},
+	{
+		"read": "./debug_out_v2_small.txt",
+		"out": "./plots/baroStuff.png",
+		"font": {
+			"title": 32,
+			"xlabel": 20,
+			"ylabel": 20,
+			"legend": 20,
+			"tick": 16
+		},
+		"width": 15,
+		"height": 8,
+		"dpi": 100,
+		"filter": {
+			"left": {
+				"key": ".timestamp_s",
+				"convert": ["ge 3800"],
+				"hint": "monotonic"
+			},
+			"right": {
+				"key": ".worldSpace.acc_mps2.z",
+				"convert": ["ge -80"],
+				"hint": "spike"
+			}
+		},
+		"annotations": [
+			{
+				"type": "text",
+				"line": 0,
+				"select": "max",
+				"x": {
+					"value": "x:@",
+					"convert": []
+				},
+				"y": {
+					"value": "y[0]:@",
+					"convert": []
+				},
+				"text": "Highest baro: {1} ft",
+				"values": [
+					{
+						"value": "y[0]:@",
+						"convert": []
+					}
+				],
+				"arrow": {
+					"dx": -300,
+					"dy": -200
+				},
+				"style": {
+					"bbox": {
+						"boxstyle": "round,pad=0.3",
+						"facecolor": "white",
+						"alpha": 0.8
+					},
+					"fontsize": 15,
+					"color": "black"
+				}
+			},
+			{
+				"type": "text",
+				"line": 1,
+				"select": "max",
+				"x": {
+					"value": "x:@",
+					"convert": []
+				},
+				"y": {
+					"value": "y[1]:@",
+					"convert": []
+				},
+				"text": "Highest gps alt: {1} ft",
+				"values": [
+					{
+						"value": "y[1]:@",
+						"convert": []
+					}
+				],
+				"arrow": {
+					"dx": -340,
+					"dy": 80
+				},
+				"style": {
+					"bbox": {
+						"boxstyle": "round,pad=0.3",
+						"facecolor": "white",
+						"alpha": 0.8
+					},
+					"fontsize": 15,
+					"color": "black"
+				}
+			}
+		],
+		"x": {
+			"key": ".timestamp_s",
+			"title": "timestamp (s)",
+			"convert": []
+		},
+		"y": [
+			{
+				"key": ".baroAlt_m",
+				"title": "baro",
+				"convert": ["-.baroAlt_m:first", "m_to_ft"]
+			},
+			{
+				"key": ".worldSpace.pos_m.z",
+				"title": "gps alt",
+				"convert": ["-.worldSpace.pos_m.z:first", "m_to_ft", "*0.93101"]
+			}
+		]
+	},
+	{
+		"read": "./debug_out_v2_small.txt",
+		"out": "./plots/controlauth.png",
+		"font": {
+			"title": 32,
+			"xlabel": 20,
+			"ylabel": 20,
+			"legend": 20,
+			"tick": 16
+		},
+		"width": 15,
+		"height": 8,
+		"dpi": 100,
+		"filter": {
+			"left": {
+				"key": ".timestamp_s",
+				"convert": ["gt 3800"],
+				"hint": "monotonic"
+			}
+		},
+		"annotations": [],
+		"x": {
+			"key": ".timestamp_s",
+			"title": "timestamp (s)",
+			"convert": []
+		},
+		"y": [
+			{
+				"key": ".controlAuth_m",
+				"title": "control authority (ft)",
+				"convert": ["/2", "m_to_ft"]
+			}
+		]
+	},
+	{
+		"read": "./debug_out_v2_small.txt",
+		"out": "./plots/predictions.png",
+		"font": {
+			"title": 32,
+			"xlabel": 20,
+			"ylabel": 20,
+			"legend": 20,
+			"tick": 16
+		},
+		"width": 15,
+		"height": 8,
+		"dpi": 100,
+		"filter": {
+			"left": {
+				"key": ".timestamp_s",
+				"convert": ["ge 3800"],
+				"hint": "monotonic"
+			},
+			"right": {
+				"key": ".worldSpace.acc_mps2.z",
+				"convert": ["ge -80"],
+				"hint": "spike"
+			}
+		},
+		"annotations": [],
+		"x": {
+			"key": ".timestamp_s",
+			"title": "timestamp (s)",
+			"convert": []
+		},
+		"y": [
+			{
+				"key": ".apogee_m_agl",
+				"title": "prediction",
+				"convert": ["-.apogee_m_agl:last", "m_to_ft"]
+			},
+			{
+				"key": ".controlAuth_m",
+				"title": "auth",
+				"convert": ["/2", "m_to_ft"]
+			},
+			{
+				"key": ".controlAuth_m",
+				"title": "auth",
+				"convert": ["/2", "*-1", "m_to_ft"]
+			}
+		]
+	},
+	{
+		"read": "./debug_out_v2_small.txt",
+		"out": "./plots/baro.png",
+		"font": {
+			"title": 32,
+			"xlabel": 20,
+			"ylabel": 20,
+			"legend": 20,
+			"tick": 16
+		},
+		"width": 15,
+		"height": 8,
+		"dpi": 100,
+		"filter": {
+			"left": {
+				"key": ".timestamp_s",
+				"convert": ["ge 3800"],
+				"hint": "monotonic"
+			},
+			"right": {
+				"key": ".worldSpace.acc_mps2.z",
+				"convert": ["ge -80"],
+				"hint": "spike"
+			}
+		},
+		"annotations": [],
+		"x": {
+			"key": ".timestamp_s",
+			"title": "timestamp (s)",
+			"convert": []
+		},
+		"y": [
+			{
+				"key": ".baro_Pa",
+				"title": "baro",
+				"convert": []
+			}
+		]
+	},
+	{
+		"read": "./debug_out_v2_small.txt",
+		"out": "./plots/barosux.png",
+		"font": {
+			"title": 32,
+			"xlabel": 20,
+			"ylabel": 20,
+			"legend": 20,
+			"tick": 16
+		},
+		"width": 15,
+		"height": 8,
+		"filter": {
+			"left": {
+				"key": ".timestamp_s",
+				"convert": ["gt 3800"],
+				"hint": "monotonic"
+			}
+		},
+		"dpi": 100,
+		"annotations": [],
+		"x": {
+			"key": ".gpsAlt_m",
+			"title": "gps",
+			"convert": ["-.gpsAlt_m:first", "m_to_ft"]
+		},
+		"y": [
+			{
+				"key": ".baroAlt_m",
+				"title": "baro",
+				"convert": ["-.baroAlt_m:first", "m_to_ft"]
+			}
+		]
+	}
+]

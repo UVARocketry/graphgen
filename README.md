@@ -111,7 +111,7 @@ One value per line:
 The parser expects `.`, the frame number, `.`, the key, `:`, and a float. Columns
 are discovered as they appear in each frame.
 
-### V2 format (recommended)
+### V2 format (recommended because it's like a billion times faster to parse)
 
 ```
 !v2
@@ -153,7 +153,7 @@ name. `debug_out_v2_small.txt` is an example.
 ```
 use "./debug_out_v2_small.txt"
 
-fn m_to_ft(input) = input / 3.28
+fn m_to_ft(input) = input * 3.28
 
 graph {
     ...
@@ -283,7 +283,7 @@ Filter sections:
   - `monotonic`: assumes the predicate is monotonic and binary-searches for the
     boundary.
   - `spike`: skips isolated values at the edge until it finds a passing run
-    surrounded by failing frames.
+    surrounded by failing frames (eg you can look for the launch frame of the rocket by running a spike filter over vertical acceleration)
   - `none`: scan inward from the edge one frame at a time.
 
 The left bound is inclusive and the right bound is exclusive. If the predicate
@@ -313,6 +313,49 @@ against the same filtered frames:
 If the selected frame or any component of an annotation is NaN, that annotation is
 replaced by `SKIP`; the other annotations are still emitted.
 
+### Lists (arrays)
+
+There is no separate list/array syntax such as `[...]` or commas. A field has the
+Zig type `[]T` (a slice) and the corresponding key is simply repeated once per
+element; the parser appends each element in source order:
+
+```zig
+pub const Point = struct {
+    x: f32,
+    y: f32,
+};
+
+pub const Config = struct {
+    name: []const u8,
+    point: []Point,
+    item: []f32,
+};
+```
+
+```
+name "example"
+point {
+    x 1
+    y 2
+}
+point {
+    x 3
+    y 4
+}
+item 10
+item 20
+item 30
+```
+
+This produces `point = [{ 1, 2 }, { 3, 4 }]` and `item = { 10, 20, 30 }`. Arrays
+are materialized at the end of parsing, so a repeated key may be interleaved with
+other keys. `[]const u8` is the exception: it is treated as a single scalar string,
+not a list of bytes. A list field itself cannot have a `#label`; labels can only be
+attached to non-list bytecode fields.
+
+In the graph backend, `y` and `annotation` are lists of structs, which is why each
+`y { ... }` or `annotation { ... }` block is a new element.
+
 ## Typed parser
 
 `src/parse/parse.zig` exposes a reflection-driven parser:
@@ -320,8 +363,6 @@ replaced by `SKIP`; the other annotations are still emitted.
 ```zig
 var parser: parse.ParserPass1 = .{ ... };
 var parsed = try parser.pass(gpa, SomeType, &diagnostic);
-var obj = try parser.parseObject(gpa, SomeType, &diagnostic);
-var value = try parser.parseValue(gpa, SomeType, keyRef, &diagnostic);
 ```
 
 Supported field types:
