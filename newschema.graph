@@ -1,0 +1,117 @@
+; the actual format of the file is up for debate but this is what i have currently
+use "./debug_out_v2_small.txt"
+
+; import "std"
+
+fn ft_to_m(input) = -(80 + 4) * input
+fn m_to_ft(input) = input * 3.28
+
+; imports functions from a c binary
+; foreign fn m_to_ft(input)
+
+; this is sorta just a easy to type out data definition language
+graph {
+    saveto "./plots/kalmanPos.png"
+    filter {
+        left {
+            ; the '=' denotes an expression context where everything after is an
+            ; expression evaluated by the runtime engine
+            value = .timestamp_s > 3800
+            hint monotonic
+        }
+        right {
+            value = .kalmanPosZ_m_agl > .kalmanPosZ_m_agl:max - 1
+            hint spike
+        }
+    }
+    x {
+        value #x = .timestamp_s + 10 * 2 - 1
+        title "timestamp (s)"
+    }
+    ; the #<label> allows other keys to refer to this axis. internally, references to
+    ; this would be stored as a handle to the element in the y array
+    y {
+        value #kalmanpos = m_to_ft(.kalmanPosZ_m_agl)
+        title "kalman pos z"
+    }
+    y {
+        value #ap_low = m_to_ft(.lowerBound_m_agl)
+        title "apogee bound lower"
+    }
+    y {
+        value #apogee = m_to_ft(.kalmanPosZ_m_agl:last)
+        title "apogee"
+    }
+
+    annotation {
+        line !#kalmanpos
+        select max
+        x !#x
+        y !#kalmanpos
+        text "Final apogee: {1} ft"
+        value = #kalmanpos
+        arrow {
+            dx -5
+            dy -2000
+        }
+    }
+    annotation {
+        line !#kalmanpos
+        select min
+        x !#x
+        y !#kalmanpos
+        text "MIN ap: {1} ft"
+        value = #kalmanpos
+        arrow {
+            dx 5
+            dy 100
+        }
+    }
+}
+
+graph {
+    saveto "./plots/kalmanPos2.png"
+    filter {
+        left {
+            ; the '=' denotes an expression context where everything after is an
+            ; expression evaluated by the runtime engine
+            value = .timestamp_s > 3800
+            hint monotonic
+        }
+        right {
+            value = .worldSpace.acc_mps2 >= -80
+            hint spike
+        }
+    }
+    x {
+        value = .timestamp_s + 10 * 2 - 1
+        title "timestamp (s)"
+    }
+    ; the #<label> allows other keys to refer to this axis. internally, references to
+    ; this would be stored as a handle to the element in the y array
+    y {
+        value = m_to_ft(.kalmanPosZ_m_agl)
+        title "kalman pos z"
+    }
+    y {
+        value = m_to_ft(.lowerBound_m_agl)
+        title "apogee bound lower"
+    }
+    y {
+        value = m_to_ft(.kalmanPosZ_m_agl:last)
+        title "apogee"
+    }
+
+    annotation {
+        line !#kalmanpos
+        select max
+        x !#x
+        y !#kalmanpos
+        text "Final apogee: {1} ft"
+        value = #kalmanpos
+        arrow {
+            dx -5
+            dy -1000
+        }
+    }
+}
