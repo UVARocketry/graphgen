@@ -29,12 +29,12 @@ There are two independent pipelines in the repository:
 - `graph` / `.graph`: the new typed parser and graph backend.
 
 The Python wrapper `debuggraph2.py` drives either pipeline and renders the result
-with matplotlib.
+with matplotlib or as a single interactive HTML report.
 
 ## Requirements
 
 - Zig 0.17.0
-- Python 3.13 with `uv` and `matplotlib` (for the Python wrapper)
+- Python 3.13 with `uv`, `matplotlib`, and `plotly` (for the Python wrapper)
 
 ## Building and testing
 
@@ -65,6 +65,51 @@ little-endian `f32` frames. `none` runs everything but suppresses chart output
 ```sh
 zig build run -- graph newschema.graph
 zig build run -- graph newschema.graph --out=bare
+```
+
+### `ingest_csv <file.csv> [output.txt] [--raw|--human]`
+
+Convert a CSV file containing numeric values into a v2 debug data file. The number
+of columns is taken from the first row. If that row is not entirely numeric it is
+treated as a header and used for column names; otherwise columns are named
+`.column_0`, `.column_1`, and so on. Empty cells and `nan`/`-nan` values become
+`NAN` in the generated f32 data. Output defaults to `./debug_out.txt` in raw mode;
+pass `--human` for a text-valued v2 file or `--out=<path>` to choose the output
+path.
+
+```sh
+zig build run -- ingest_csv data.csv
+zig build run -- ingest_csv data.csv plots/data_v2.txt --human
+```
+
+### `transformcsv <file.graph> [--out=<file.csv>]`
+
+Transform a csv or v2 debug data file as described by a `.graph` file and write
+the result as csv. The config's top-level keys are the input data file (`use`),
+an optional frame window (`filter`), new columns computed per frame (`add`), and
+columns removed from the output (`drop`):
+
+```graph
+use "data.csv"
+filter {
+  left {
+    value = .a > 0
+    hint none
+  }
+}
+add {
+  name "sum"
+  value = .a + .b
+}
+drop ".b"
+```
+
+Every frame inside the filter window gets a row; columns with no value at a frame
+print as `nan`. Keys referenced by `filter` or `add` must exist in the data file.
+Output goes to stdout, or to a file with `--out=<path>`.
+
+```sh
+zig build run -- transformcsv transform.graph --out=filtered.csv
 ```
 
 ### `plot <file.json> [--out=human|bare|none]`
@@ -222,6 +267,7 @@ The graph backend expects this shape (`src/backends/graph.zig`):
 ```
 graph {
     saveto "./plots/output.png"
+    ylabel "altitude (ft)"
 
     filter {
         left {
@@ -272,7 +318,8 @@ graph {
 }
 ```
 
-`saveto`, `filter`, and `x` are required. `y` and `annotation` are repeated keys that
+`saveto`, `filter`, and `x` are required. `title` and `ylabel` are optional chart
+labels. `y` and `annotation` are repeated keys that
 accumulate into slices: both may appear any number of times (including zero), and
 each `annotation` block produces one annotation in the output.
 
@@ -433,6 +480,7 @@ CHART
 SAVE:<saveto>
 TITLE:
 x:<x title>
+ylabel:<y axis title>
 width:0
 height:0
 dpi:0
@@ -483,6 +531,8 @@ output while still parsing data and executing frame expressions.
 uv run debuggraph2.py graph newschema.graph
 uv run debuggraph2.py plot gthing2.json
 uv run debuggraph2.py plot newschema.graph     # .graph routes to graph
+uv run debuggraph2.py html newschema.graph     # single interactive HTML report
+uv run debuggraph2.py html a.graph b.graph -o plots/report.html
 uv run debuggraph2.py resultsof gthing2.json
 uv run debuggraph2.py list_keys debug_out_v2_small.txt
 ```
@@ -491,6 +541,12 @@ The wrapper builds the Zig binary in `ReleaseFast`, runs it with `--out=bare`,
 parses the text/binary stream, and renders each chart with matplotlib. It uses the
 chart's `saveto` path to write the image and also applies `{N}` annotation text,
 arrows, and the available style fields (font size, color, bbox).
+
+The `html` backend puts every chart from every input file into one self-contained
+HTML page, including annotations and arrows. Each plot is rendered with Plotly and
+supports per-chart zooming, panning, scroll-to-zoom, hover readouts, and responsive
+resizing. The output defaults to the first input path with a `.html` extension; use
+`-o` / `--out` to choose a different path.
 
 ## Project layout
 
@@ -507,7 +563,7 @@ src/parse/resulttype.zig   configurable bytecode field helper
 src/backends/graph.zig     .graph schema, frame loop, chart/annotation output
 src/parse_txt.zig          legacy and v2 data file parsing
 src/passes/                legacy JSON compiler and interpreter
-debuggraph2.py             matplotlib frontend
+debuggraph2.py             matplotlib / interactive HTML frontend
 newschema.graph            example .graph file
 debug_out_v2_small.txt     example v2 data file
 ```

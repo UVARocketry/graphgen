@@ -331,8 +331,8 @@ pub const BytecodeFilter = struct {
             none,
         },
     };
-    left: FilterSection,
-    right: FilterSection,
+    left: ?FilterSection,
+    right: ?FilterSection,
 };
 
 pub const BytecodeInterpreter = struct {
@@ -478,8 +478,10 @@ pub const BytecodeInterpreter = struct {
     pub fn resolveFilterBound(
         self: *BytecodeInterpreter,
         findLeft: bool,
-        section: BytecodeFilter.FilterSection,
+        sectionopt: ?BytecodeFilter.FilterSection,
     ) OptionalU31 {
+        if (sectionopt == null) return .nil;
+        const section = sectionopt.?;
         const leftFrame = self.store.leftFrame.orElse(0);
         const rightFrame = self.store.rightFrame.orElse(self.store.maxFrame);
 

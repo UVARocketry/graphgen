@@ -11,6 +11,7 @@ const second = debuggraph_zig.second;
 const third = debuggraph_zig.third;
 const interpret = debuggraph_zig.interpret;
 const graph = debuggraph_zig.graph;
+const transformcsv = debuggraph_zig.transformcsv;
 // const Res = @import("parse/types.zig").Graphs;
 const parse = debuggraph_zig.parse;
 
@@ -48,6 +49,252 @@ pub fn parsePlot(args: []const []const u8, errorStr: *[]const u8) !PlotArgs {
     return ret;
 }
 
+const IngestCsvArgs = struct {
+    csvFile: []const u8,
+    outFile: []const u8 = "debug_out.txt",
+    mode: parseOut.V2OutMode = .raw,
+};
+
+pub fn parseIngestCsvArgs(
+    args: []const []const u8,
+    errorStr: *[]const u8,
+) !IngestCsvArgs {
+    var positional: [2][]const u8 = undefined;
+    var positionalCount: usize = 0;
+    var ret: IngestCsvArgs = .{ .csvFile = "" };
+
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--human")) {
+            ret.mode = .human;
+        } else if (std.mem.eql(u8, arg, "--raw")) {
+            ret.mode = .raw;
+        } else if (std.mem.eql(u8, arg, "--mode=human")) {
+            ret.mode = .human;
+        } else if (std.mem.eql(u8, arg, "--mode=raw")) {
+            ret.mode = .raw;
+        } else if (std.mem.startsWith(u8, arg, "--out=")) {
+            ret.outFile = arg["--out=".len..];
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            errorStr.* = "Unknown option for 'ingest_csv'";
+            return error.UnknownArgument;
+        } else {
+            if (positionalCount >= positional.len) {
+                errorStr.* = "Too many arguments for 'ingest_csv'";
+                return error.TooManyArguments;
+            }
+            positional[positionalCount] = arg;
+            positionalCount += 1;
+        }
+    }
+
+    if (positionalCount == 0) {
+        errorStr.* = "No CSV file given to 'ingest_csv'";
+        return error.MissingArgument;
+    }
+
+    ret.csvFile = positional[0];
+    if (positionalCount >= 2) ret.outFile = positional[1];
+    return ret;
+}
+
+pub fn doIngestCsv(
+    io: Io,
+    gpa: Allocator,
+    pageAlloc: Allocator,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    args: []const []const u8,
+) !void {
+    var errorStr: []const u8 = "";
+    const subArgs = if (args.len >= 3) args[2..] else &.{};
+    const ingestArgs = parseIngestCsvArgs(subArgs, &errorStr) catch |e| {
+        try stdout.print("Error from 'ingest_csv' subcommand!\n  {s}\n", .{errorStr});
+        return e;
+    };
+
+    const csvContents = try f.readFileToString(io, ingestArgs.csvFile, pageAlloc);
+    defer pageAlloc.free(csvContents);
+
+    var diagnostic: ?[]const u8 = null;
+    defer if (diagnostic) |message| gpa.free(message);
+
+    var start = std.Io.Clock.awake.now(io);
+    const columns = parseOut.parseCsv(gpa, csvContents, &diagnostic) catch |e| {
+        if (diagnostic) |message| {
+            try stderr.print("Failed to parse '{s}': {s}\n", .{
+                ingestArgs.csvFile,
+                message,
+            });
+        }
+        return e;
+    };
+    var end = std.Io.Clock.awake.now(io);
+    var nanos: f64 = @floatFromInt(start.durationTo(end).nanoseconds);
+    std.debug.print("parseCsv took {}s\n", .{nanos / 1.0e9});
+
+    defer {
+        for (columns) |*column| column.deinit(gpa);
+        gpa.free(columns);
+    }
+
+    start = std.Io.Clock.awake.now(io);
+    const output = try parseOut.writeV2Txt(gpa, columns, ingestArgs.mode);
+    end = std.Io.Clock.awake.now(io);
+    nanos = @floatFromInt(start.durationTo(end).nanoseconds);
+    std.debug.print("writeV2Txt took {}s\n", .{nanos / 1.0e9});
+
+    defer gpa.free(output);
+
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = ingestArgs.outFile,
+        .data = output,
+    });
+
+    const frameCount = if (columns.len == 0) 0 else columns[0].values.len;
+    try stdout.print(
+        "Wrote {s} ({} columns, {} frames, {s} mode)\n",
+        .{
+            ingestArgs.outFile,
+            columns.len,
+            frameCount,
+            @tagName(ingestArgs.mode),
+        },
+    );
+}
+
+const TransformCsvArgs = struct {
+    graphFile: []const u8,
+    outFile: ?[]const u8 = null,
+};
+
+pub fn parseTransformCsvArgs(
+    args: []const []const u8,
+    errorStr: *[]const u8,
+) !TransformCsvArgs {
+    var positional: [1][]const u8 = undefined;
+    var positionalCount: usize = 0;
+    var ret: TransformCsvArgs = .{ .graphFile = "" };
+
+    for (args) |arg| {
+        if (std.mem.startsWith(u8, arg, "--out=")) {
+            ret.outFile = arg["--out=".len..];
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            errorStr.* = "Unknown option for 'transformcsv'";
+            return error.UnknownArgument;
+        } else {
+            if (positionalCount >= positional.len) {
+                errorStr.* = "Too many arguments for 'transformcsv'";
+                return error.TooManyArguments;
+            }
+            positional[positionalCount] = arg;
+            positionalCount += 1;
+        }
+    }
+
+    if (positionalCount == 0) {
+        errorStr.* = "No .graph file given to 'transformcsv'";
+        return error.MissingArgument;
+    }
+
+    ret.graphFile = positional[0];
+    return ret;
+}
+
+pub fn doTransformCsv(
+    io: Io,
+    gpa: Allocator,
+    pageAlloc: Allocator,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    args: []const []const u8,
+) !void {
+    var errorStr: []const u8 = "";
+    const subArgs = if (args.len >= 3) args[2..] else &.{};
+    const transformArgs = parseTransformCsvArgs(subArgs, &errorStr) catch |e| {
+        try stdout.print("Error from 'transformcsv' subcommand!\n  {s}\n", .{errorStr});
+        return e;
+    };
+
+    const graphContents = try f.readFileToString(io, transformArgs.graphFile, pageAlloc);
+    defer pageAlloc.free(graphContents);
+
+    var diagnostic: f.Diagnostic = .{
+        .gpa = gpa,
+        .extraRefs = .empty,
+        .filename = transformArgs.graphFile,
+        .message = &.{},
+        .from = .from(""),
+    };
+    defer diagnostic.deinit();
+
+    errdefer {
+        if (diagnostic.message.len != 0) {
+            diagnostic.print(stderr, graphContents) catch {};
+            stderr.flush() catch {};
+        }
+    }
+
+    var parser: parse.ParserPass1 = .{
+        .bytecodeStream = .{
+            .arr = .empty,
+        },
+        .keyrefTable = .empty,
+        .scope = .empty,
+        .lexer = .init(graphContents),
+        .paramNames = .empty,
+        .bytecodeStarts = .empty,
+    };
+    parser.paramNames = .initBuffer(&parser.paramNameBuf);
+    defer parser.deinit(gpa);
+
+    var parsed = try parser.pass(gpa, transformcsv.Type, &diagnostic);
+    defer transformcsv.deinit(gpa, &parsed);
+
+    var cache: bc.ValueCache = .init();
+    defer cache.deinit(gpa);
+
+    // transformcsv.run grows the interpreter's stack itself if the filter or
+    // add expressions need more room than this
+    var dummyStack: [1]f32 = undefined;
+
+    var bytecode: bc.BytecodeInterpreter = .{
+        .keyrefNames = parser.keyrefTable.items,
+        .reader = .{
+            .bytecode = parser.bytecodeStream.arr.items,
+            .pos = 0,
+        },
+        .stackAllocator = .failing,
+        .valueStack = .initBuffer(&dummyStack),
+        .datastoreAllocator = gpa,
+        .store = .{
+            .maxFrame = 0,
+            .leftFrame = .nil,
+            .rightFrame = .nil,
+            .frames = &.{},
+            .cache = &cache,
+        },
+    };
+
+    const start = std.Io.Clock.awake.now(io);
+
+    if (transformArgs.outFile) |outFile| {
+        const file = try std.Io.Dir.cwd().createFile(io, outFile, .{});
+        defer file.close(io);
+
+        var buffer: [1024 * 64]u8 = undefined;
+        var fileWriter: Io.File.Writer = .init(file, io, &buffer);
+        try transformcsv.run(io, gpa, pageAlloc, &parsed, &fileWriter.interface, &bytecode);
+        try fileWriter.interface.flush();
+        try stdout.print("Wrote {s}\n", .{outFile});
+    } else {
+        try transformcsv.run(io, gpa, pageAlloc, &parsed, stdout, &bytecode);
+    }
+
+    const end = std.Io.Clock.awake.now(io);
+    const nanos: f64 = @floatFromInt(start.durationTo(end).nanoseconds);
+    std.debug.print("transform took {}s\n", .{nanos / 1.0e9});
+}
+
 const GraphArgs = struct {
     file: []const u8,
     outputType: graph.OutType,
@@ -82,8 +329,12 @@ pub fn parseGraphArgs(args: []const []const u8, errorStr: *[]const u8) !GraphArg
 fn maxStackUsage(bytecode: *bc.BytecodeInterpreter, graphs: *const graph.Graphs) !u32 {
     var max: u32 = 1;
     for (graphs.graph) |g| {
-        max = @max(max, try bytecode.getMaxStackUsage(g.filter.left.value));
-        max = @max(max, try bytecode.getMaxStackUsage(g.filter.right.value));
+        if (g.filter.left) |l| {
+            max = @max(max, try bytecode.getMaxStackUsage(l.value));
+        }
+        if (g.filter.right) |r| {
+            max = @max(max, try bytecode.getMaxStackUsage(r.value));
+        }
         max = @max(max, try bytecode.getMaxStackUsage(g.x.value));
         for (g.y) |axis| {
             max = @max(max, try bytecode.getMaxStackUsage(axis.value));
@@ -131,6 +382,8 @@ pub fn doGraph(
             stderr.flush() catch {};
         }
     }
+
+    var start = std.Io.Clock.awake.now(io);
 
     var parser: parse.ParserPass1 = .{
         .bytecodeStream = .{
@@ -184,6 +437,9 @@ pub fn doGraph(
         &bytecode,
         graphArgs.outputType,
     );
+    const end = std.Io.Clock.awake.now(io);
+    const nanos: f32 = @floatFromInt(start.durationTo(end).nanoseconds);
+    std.debug.print("parse + execute took {}s\n", .{nanos / 1.0e9});
 }
 
 pub fn resultsOf(
@@ -637,7 +893,9 @@ pub fn main(init: std.process.Init) !void {
     try stdout.flush();
 
     if (args.len == 1) {
-        _ = try stdout.write("need a subcommand: can have 'plot'\n");
+        _ = try stdout.write(
+            "need a subcommand: can have 'plot', 'graph', 'ingest_csv', 'transformcsv'\n",
+        );
         return;
     }
 
@@ -651,6 +909,12 @@ pub fn main(init: std.process.Init) !void {
         try stdout.flush();
     } else if (std.mem.eql(u8, subcommand, "graph")) {
         try doGraph(io, init.gpa, std.heap.page_allocator, stdout, stderr, args);
+        try stdout.flush();
+    } else if (std.mem.eql(u8, subcommand, "ingest_csv")) {
+        try doIngestCsv(io, init.gpa, std.heap.page_allocator, stdout, stderr, args);
+        try stdout.flush();
+    } else if (std.mem.eql(u8, subcommand, "transformcsv")) {
+        try doTransformCsv(io, init.gpa, std.heap.page_allocator, stdout, stderr, args);
         try stdout.flush();
     } else if (std.mem.eql(u8, subcommand, "list_keys")) {
         try listKeys(io, init.gpa, std.heap.page_allocator, stdout, args);

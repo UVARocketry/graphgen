@@ -249,6 +249,58 @@ pub const ParserPass1 = struct {
         };
     }
 
+    /// Returns the element type of `T`'s `extraFields` field if `T` has one,
+    /// or null if it doesn't. A field named `extraFields` may only ever be a
+    /// slice (not nullable, not optional, not anything else) of a struct
+    /// with exactly two fields: `name` (must be `[]const u8`) and `value`
+    /// (any type). Unmatched keys are collected into it.
+    fn extraFieldsInfo(comptime T: type) ?type {
+        const FT: ?type = inline for (@typeInfo(T).@"struct".field_names) |name| {
+            if (std.mem.eql(u8, name, "extraFields")) break @FieldType(T, "extraFields");
+        } else null;
+        if (FT == null) return null;
+
+        const ptr = switch (@typeInfo(FT.?)) {
+            .pointer => |p| p,
+            else => @compileError(extraFieldsShapeError(T, FT.?)),
+        };
+        if (ptr.size != .slice) @compileError(extraFieldsShapeError(T, FT.?));
+
+        const Extra = ptr.child;
+        const einfo = switch (@typeInfo(Extra)) {
+            .@"struct" => |s| s,
+            else => @compileError(extraFieldsShapeError(T, FT.?)),
+        };
+        if (einfo.field_names.len != 2) {
+            @compileError(extraFieldsShapeError(T, FT.?));
+        }
+
+        var hasName = false;
+        var hasValue = false;
+        inline for (einfo.field_names, einfo.field_types) |fname, ftype| {
+            if (std.mem.eql(u8, fname, "name")) {
+                if (ftype != []const u8) {
+                    @compileError(extraFieldsShapeError(T, FT.?));
+                }
+                hasName = true;
+            } else if (std.mem.eql(u8, fname, "value")) {
+                hasValue = true;
+            }
+        }
+        if (!hasName or !hasValue) {
+            @compileError(extraFieldsShapeError(T, FT.?));
+        }
+
+        return Extra;
+    }
+
+    fn extraFieldsShapeError(comptime T: type, comptime FT: type) []const u8 {
+        return "field 'extraFields' of type '" ++ @typeName(T) ++
+            "' must be a slice (not nullable, not optional, not any other type) of a struct" ++
+            " with exactly two fields, 'name: []const u8' and 'value' (any type)," ++
+            " instead got '" ++ @typeName(FT) ++ "'";
+    }
+
     /// Builds a struct with one `ArrayListUnmanaged` per slice field of `T`,
     /// named after the field it accumulates.
     fn SliceLists(comptime T: type) type {
@@ -406,7 +458,9 @@ pub const ParserPass1 = struct {
             @field(lists, name).deinit(alloc);
         };
 
+        const lbrace = self.lexer.currentTokenString;
         var currentToken = try self.lexer.getNextToken(diagnostic);
+        var rbrace: ?[]const u8 = null;
         while (true) {
             if (currentToken == .rbrace or currentToken == .eof) {
                 if (!topLevel and currentToken == .eof) {
@@ -431,7 +485,14 @@ pub const ParserPass1 = struct {
                     diagnostic.from = .from(self.lexer.currentTokenString);
                     return error.UnexpectedToken;
                 }
+                if (currentToken == .rbrace) {
+                    rbrace = self.lexer.currentTokenString;
+                }
                 break;
+            }
+            const next = try self.lexer.peekNextToken(diagnostic);
+            if (next.tp == .eof) {
+                rbrace = self.lexer.currentTokenString;
             }
             if (currentToken == .newline) {
                 currentToken = try self.lexer.getNextToken(diagnostic);
@@ -509,6 +570,8 @@ pub const ParserPass1 = struct {
                 // parsed above
             } else if (attrs.defaultValue(FT)) |default| {
                 @field(value, name) = default;
+            } else if (comptime @typeInfo(FT) == .optional) {
+                @field(value, name) = null;
             } else {
                 var w = diagnostic.writer();
                 defer w.deinit();
@@ -517,7 +580,8 @@ pub const ParserPass1 = struct {
                     .{name},
                 );
                 diagnostic.message = try w.toOwnedSlice();
-                diagnostic.from = .from(name);
+                diagnostic.from = .from(rbrace.?);
+                try diagnostic.addRef(.init("While parsing object starting with", .from(lbrace)));
                 return error.MissingField;
             }
         }
@@ -558,6 +622,10 @@ pub const ParserPass1 = struct {
         }
 
         if (!matched) {
+            if (comptime extraFieldsInfo(T)) |Extra| {
+                try self.parseExtraField(alloc, T, Extra, keyName, keyRef, lists, diagnostic);
+                return;
+            }
             var w = diagnostic.writer();
             defer w.deinit();
             try w.writer.print(
@@ -568,6 +636,62 @@ pub const ParserPass1 = struct {
             diagnostic.from = keyRef;
             return error.UnknownField;
         }
+    }
+
+    /// Parses a key that didn't match any field of `T`, collecting it into
+    /// `T`'s `extraFields` list. The value is type checked against the type
+    /// of the `value` field of `Extra`.
+    fn parseExtraField(
+        self: *Parser,
+        alloc: Allocator,
+        comptime T: type,
+        comptime Extra: type,
+        keyName: []const u8,
+        keyRef: files.FileRef,
+        lists: *SliceLists(T),
+        diagnostic: *Diagnostic,
+    ) Pass1Error!void {
+        const V = @FieldType(Extra, "value");
+
+        const next = try self.lexer.peekNextToken(diagnostic);
+        var labelName: ?[]const u8 = null;
+        if (next.tp == .valuerefdecl) {
+            _ = try self.lexer.getNextToken(diagnostic);
+            labelName = self.lexer.currentString.?;
+        }
+
+        const parsed = try self.parseValue(alloc, V, keyRef, diagnostic);
+
+        if (labelName) |lname| {
+            if (comptime !isBytecode(V)) {
+                var w = diagnostic.writer();
+                defer w.deinit();
+                try w.writer.print(
+                    "parse error: key '{s}' cannot be named with '#{s}' because it is not an interpreted value",
+                    .{ keyRef.str, lname },
+                );
+                diagnostic.message = try w.toOwnedSlice();
+                diagnostic.from = .from(lname);
+                try diagnostic.addRef(.{
+                    .staticMessage = "while parsing key",
+                    .ref = keyRef,
+                });
+                return error.TypeMismatch;
+            }
+            const scopeIndex = try self.defineScopeItem(
+                alloc,
+                lname,
+                .valueref,
+                .from(lname),
+                diagnostic,
+            );
+            self.scope.items[scopeIndex].bytecodeRef = bytecodeRefOf(V, parsed);
+        }
+
+        try @field(lists, "extraFields").append(alloc, .{
+            .name = keyName,
+            .value = parsed,
+        });
     }
 
     fn parseStructField(
@@ -1165,6 +1289,18 @@ pub const ParserPass1 = struct {
         keyRef: files.FileRef,
         diagnostic: *Diagnostic,
     ) Pass1Error!T {
+        switch (@typeInfo(T)) {
+            .optional => |optional| {
+                const next = try self.lexer.peekNextToken(diagnostic);
+                if (next.tp == .kwd_null) {
+                    _ = try self.lexer.getNextToken(diagnostic);
+                    return null;
+                }
+                return try self.parseValue(alloc, optional.child, keyRef, diagnostic);
+            },
+            else => {},
+        }
+
         if (comptime isBytecode(T)) {
             const next = try self.lexer.peekNextToken(diagnostic);
             switch (next.tp) {

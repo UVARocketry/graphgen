@@ -10,6 +10,7 @@ pub const second = @import("passes/second.zig");
 pub const third = @import("passes/third.zig");
 pub const interpret = @import("passes/interpret.zig");
 pub const graph = @import("backends/graph.zig");
+pub const transformcsv = @import("backends/transformcsv.zig");
 // const Res = @import("parse/types.zig").Graphs;
 pub const parse = @import("parse/parse.zig");
 
@@ -27,6 +28,7 @@ _: std.testing.refAllDecls(bc),
 test {
     _ = bc;
     std.testing.refAllDecls(graph);
+    std.testing.refAllDecls(transformcsv);
 }
 
 test "basic add functionality" {
@@ -89,12 +91,230 @@ test "typed parse" {
     try std.testing.expect(value.value.len > 0);
 }
 
+test "optional fields" {
+    const gpa = std.testing.allocator;
+    const T = struct {
+        maybe: ?f32,
+        name: ?[]const u8,
+        omitted: ?u32,
+    };
+    const src =
+        \\maybe 2.5
+        \\name null
+        \\
+    ;
+
+    var diagnostic: f.Diagnostic = .{
+        .gpa = gpa,
+        .extraRefs = .empty,
+        .filename = "test",
+        .message = &.{},
+        .from = .from(""),
+    };
+    defer diagnostic.deinit();
+
+    var parser: parse.ParserPass1 = .{
+        .lexer = .init(src),
+        .bytecodeStream = .{ .arr = .empty },
+        .scope = .empty,
+        .keyrefTable = .empty,
+        .paramNames = .empty,
+        .bytecodeStarts = .empty,
+    };
+    parser.paramNames = .initBuffer(&parser.paramNameBuf);
+    defer parser.deinit(gpa);
+
+    const value = try parser.pass(gpa, T, &diagnostic);
+    try std.testing.expectEqual(@as(?f32, 2.5), value.maybe);
+    try std.testing.expectEqual(@as(?[]const u8, null), value.name);
+    try std.testing.expectEqual(@as(?u32, null), value.omitted);
+}
+
+test "extra fields" {
+    const gpa = std.testing.allocator;
+    const T = struct {
+        name: []const u8,
+        count: f32,
+        extraFields: []const struct {
+            name: []const u8,
+            value: ?f32,
+        },
+    };
+    const src =
+        \\name "hi"
+        \\count 2.5
+        \\foo 1
+        \\bar null
+        \\baz -2.5
+        \\
+    ;
+
+    var diagnostic: f.Diagnostic = .{
+        .gpa = gpa,
+        .extraRefs = .empty,
+        .filename = "test",
+        .message = &.{},
+        .from = .from(""),
+    };
+    defer diagnostic.deinit();
+
+    var parser: parse.ParserPass1 = .{
+        .lexer = .init(src),
+        .bytecodeStream = .{ .arr = .empty },
+        .scope = .empty,
+        .keyrefTable = .empty,
+        .paramNames = .empty,
+        .bytecodeStarts = .empty,
+    };
+    parser.paramNames = .initBuffer(&parser.paramNameBuf);
+    defer parser.deinit(gpa);
+
+    const value = try parser.pass(gpa, T, &diagnostic);
+    defer gpa.free(value.extraFields);
+
+    try std.testing.expectEqualStrings("hi", value.name);
+    try std.testing.expectEqual(@as(f32, 2.5), value.count);
+    try std.testing.expectEqual(@as(usize, 3), value.extraFields.len);
+    try std.testing.expectEqualStrings("foo", value.extraFields[0].name);
+    try std.testing.expectEqual(@as(?f32, 1), value.extraFields[0].value);
+    try std.testing.expectEqualStrings("bar", value.extraFields[1].name);
+    try std.testing.expectEqual(@as(?f32, null), value.extraFields[1].value);
+    try std.testing.expectEqualStrings("baz", value.extraFields[2].name);
+    try std.testing.expectEqual(@as(?f32, -2.5), value.extraFields[2].value);
+}
+
+test "extra fields empty" {
+    const gpa = std.testing.allocator;
+    const T = struct {
+        extraFields: []const struct {
+            name: []const u8,
+            value: []const u8,
+        },
+    };
+    const src =
+        \\
+    ;
+
+    var diagnostic: f.Diagnostic = .{
+        .gpa = gpa,
+        .extraRefs = .empty,
+        .filename = "test",
+        .message = &.{},
+        .from = .from(""),
+    };
+    defer diagnostic.deinit();
+
+    var parser: parse.ParserPass1 = .{
+        .lexer = .init(src),
+        .bytecodeStream = .{ .arr = .empty },
+        .scope = .empty,
+        .keyrefTable = .empty,
+        .paramNames = .empty,
+        .bytecodeStarts = .empty,
+    };
+    parser.paramNames = .initBuffer(&parser.paramNameBuf);
+    defer parser.deinit(gpa);
+
+    const value = try parser.pass(gpa, T, &diagnostic);
+    defer gpa.free(value.extraFields);
+
+    try std.testing.expectEqual(@as(usize, 0), value.extraFields.len);
+}
+
+test "extra fields bytecode" {
+    const gpa = std.testing.allocator;
+    const types = @import("parse/types.zig");
+    const T = struct {
+        x: types.Bytecode,
+        extraFields: []const struct {
+            name: []const u8,
+            value: types.Bytecode,
+        },
+    };
+    const src =
+        \\x = .a + 1
+        \\foo #f = .a * 2
+        \\bar !#f
+        \\
+    ;
+
+    var diagnostic: f.Diagnostic = .{
+        .gpa = gpa,
+        .extraRefs = .empty,
+        .filename = "test",
+        .message = &.{},
+        .from = .from(""),
+    };
+    defer diagnostic.deinit();
+
+    var parser: parse.ParserPass1 = .{
+        .lexer = .init(src),
+        .bytecodeStream = .{ .arr = .empty },
+        .scope = .empty,
+        .keyrefTable = .empty,
+        .paramNames = .empty,
+        .bytecodeStarts = .empty,
+    };
+    parser.paramNames = .initBuffer(&parser.paramNameBuf);
+    defer parser.deinit(gpa);
+
+    const value = try parser.pass(gpa, T, &diagnostic);
+    defer gpa.free(value.extraFields);
+
+    try std.testing.expectEqual(@as(usize, 2), value.extraFields.len);
+    try std.testing.expectEqualStrings("foo", value.extraFields[0].name);
+    try std.testing.expect(value.extraFields[0].value.len > 0);
+    try std.testing.expectEqualStrings("bar", value.extraFields[1].name);
+    try std.testing.expectEqual(
+        value.extraFields[0].value.start,
+        value.extraFields[1].value.start,
+    );
+}
+
+test "unknown key without extraFields" {
+    const gpa = std.testing.allocator;
+    const T = struct {
+        name: []const u8,
+    };
+    const src =
+        \\name "hi"
+        \\nope 1
+        \\
+    ;
+
+    var diagnostic: f.Diagnostic = .{
+        .gpa = gpa,
+        .extraRefs = .empty,
+        .filename = "test",
+        .message = &.{},
+        .from = .from(""),
+    };
+    defer diagnostic.deinit();
+
+    var parser: parse.ParserPass1 = .{
+        .lexer = .init(src),
+        .bytecodeStream = .{ .arr = .empty },
+        .scope = .empty,
+        .keyrefTable = .empty,
+        .paramNames = .empty,
+        .bytecodeStarts = .empty,
+    };
+    parser.paramNames = .initBuffer(&parser.paramNameBuf);
+    defer parser.deinit(gpa);
+
+    try std.testing.expectError(
+        error.UnknownField,
+        parser.pass(gpa, T, &diagnostic),
+    );
+}
+
 test "multiple annotations" {
     const gpa = std.testing.allocator;
     const src =
         \\use "data"
         \\graph {
         \\  saveto "out"
+        \\  ylabel "alt"
         \\  filter {
         \\    left {
         \\      value = .a
@@ -165,6 +385,7 @@ test "multiple annotations" {
     defer graph.deinit(gpa, &value);
 
     try std.testing.expectEqual(@as(usize, 1), value.graph.len);
+    try std.testing.expectEqualStrings("alt", value.graph[0].ylabel);
     try std.testing.expectEqual(@as(usize, 2), value.graph[0].annotation.len);
     try std.testing.expectEqualStrings("a", value.graph[0].annotation[0].text);
     try std.testing.expectEqualStrings("b", value.graph[0].annotation[1].text);

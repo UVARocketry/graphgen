@@ -21,6 +21,7 @@ pub const TokenType = enum {
     kwd_fn,
     kwd_import,
     kwd_foreign,
+    kwd_null,
 
     keyref,
 

@@ -275,7 +275,257 @@ pub fn parseV2Txt(gpa: Allocator, data: []const u8, diagnostic: *?[]const u8) ![
         }
     }
     std.debug.print("Parsed {} values!\n", .{totalValues});
+    var frames: usize = 0;
+    for (ret.items) |col| {
+        frames = @max(col.values.len, frames);
+    }
+    std.debug.print("Parsed {} frames!\n", .{frames});
     return try gpa.dupe(Column, ret.items);
+}
+
+pub const V2OutMode = enum {
+    raw,
+    human,
+};
+
+fn parseCsvNumber(text: []const u8) !f32 {
+    if (text.len == 0) return std.math.nan(f32);
+    if (std.ascii.eqlIgnoreCase(text, "nan") or
+        std.ascii.eqlIgnoreCase(text, "-nan") or
+        std.ascii.eqlIgnoreCase(text, "+nan") or
+        std.ascii.eqlIgnoreCase(text, "na") or
+        std.ascii.eqlIgnoreCase(text, "n/a") or
+        std.ascii.eqlIgnoreCase(text, "null"))
+    {
+        return std.math.nan(f32);
+    }
+    return std.fmt.parseFloat(f32, text);
+}
+
+fn csvRowLooksLikeHeader(fields: []const []const u8) bool {
+    for (fields) |raw| {
+        const text = std.mem.trim(u8, raw, " \t\r\x00");
+        if (text.len == 0) continue;
+        _ = parseCsvNumber(text) catch return true;
+    }
+    return false;
+}
+
+fn appendCsvRow(
+    gpa: Allocator,
+    columns: *std.ArrayList(std.ArrayList(f32)),
+    line: []const u8,
+    lineNo: usize,
+    diagnostic: *?[]const u8,
+) !void {
+    var fields = std.mem.splitScalar(u8, line, ',');
+    var columnIndex: usize = 0;
+
+    while (fields.next()) |raw| : (columnIndex += 1) {
+        if (columnIndex >= columns.items.len) {
+            diagnostic.* = try std.fmt.allocPrint(
+                gpa,
+                "Line {d}: expected {} columns but found more",
+                .{ lineNo, columns.items.len },
+            );
+            return error.TooManyColumns;
+        }
+
+        const text = std.mem.trim(u8, raw, " \t\r\x00");
+        const value = parseCsvNumber(text) catch {
+            diagnostic.* = try std.fmt.allocPrint(
+                gpa,
+                "Line {d}: invalid number '{s}'",
+                .{ lineNo, text },
+            );
+            return error.InvalidNumber;
+        };
+        try columns.items[columnIndex].append(gpa, value);
+    }
+
+    // Be forgiving of short rows; missing values are represented by NaN.
+    while (columnIndex < columns.items.len) : (columnIndex += 1) {
+        try columns.items[columnIndex].append(gpa, std.math.nan(f32));
+    }
+}
+
+fn csvColumnNameExists(existing: []const Column, name: []const u8) bool {
+    for (existing) |column| {
+        if (std.mem.eql(u8, column.name, name)) return true;
+    }
+    return false;
+}
+
+fn makeCsvColumnName(
+    gpa: Allocator,
+    raw: []const u8,
+    index: usize,
+    existing: []const Column,
+) ![]u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n\x00");
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, ".")) {
+        return std.fmt.allocPrint(gpa, ".column_{d}", .{index});
+    }
+
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+
+    var start: usize = 0;
+    if (trimmed[0] == '.') {
+        try buf.append(gpa, '.');
+        start = 1;
+    } else {
+        try buf.append(gpa, '.');
+    }
+
+    for (trimmed[start..]) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '.') {
+            try buf.append(gpa, c);
+        } else {
+            try buf.append(gpa, '_');
+        }
+    }
+
+    const base = try buf.toOwnedSlice(gpa);
+    errdefer gpa.free(base);
+
+    if (!csvColumnNameExists(existing, base)) return base;
+
+    var suffix: usize = 2;
+    while (true) : (suffix += 1) {
+        const candidate = try std.fmt.allocPrint(
+            gpa,
+            "{s}_{d}",
+            .{ base, suffix },
+        );
+        if (!csvColumnNameExists(existing, candidate)) {
+            gpa.free(base);
+            return candidate;
+        }
+        gpa.free(candidate);
+    }
+}
+
+/// Parse a CSV file containing numeric values. If the first row is not
+/// entirely numeric it is treated as a header; otherwise columns are named
+/// `.column_0`, `.column_1`, and so on. `nan`/`-nan` and empty cells become
+/// `std.math.nan(f32)`.
+pub fn parseCsv(gpa: Allocator, data: []const u8, diagnostic: *?[]const u8) ![]Column {
+    var csv = data;
+    if (std.mem.startsWith(u8, csv, "\xEF\xBB\xBF")) csv = csv[3..];
+
+    var columns: std.ArrayList(std.ArrayList(f32)) = .empty;
+    defer {
+        for (columns.items) |*column| column.deinit(gpa);
+        columns.deinit(gpa);
+    }
+
+    var columnNames: std.ArrayList([]const u8) = .empty;
+    defer columnNames.deinit(gpa);
+
+    var pos: usize = 0;
+    var lineNo: usize = 0;
+
+    while (pos < csv.len) {
+        const eol = std.mem.findScalarPos(u8, csv, pos, '\n') orelse csv.len;
+        const line = std.mem.trim(u8, csv[pos..eol], " \t\r\x00");
+        pos = if (eol < csv.len) eol + 1 else csv.len;
+        lineNo += 1;
+
+        if (line.len == 0) continue;
+
+        if (columns.items.len == 0) {
+            var firstFields: std.ArrayList([]const u8) = .empty;
+            defer firstFields.deinit(gpa);
+
+            var fields = std.mem.splitScalar(u8, line, ',');
+            while (fields.next()) |field| {
+                try firstFields.append(gpa, field);
+            }
+
+            if (firstFields.items.len == 0) continue;
+
+            try columns.ensureUnusedCapacity(gpa, firstFields.items.len);
+            for (0..firstFields.items.len) |_| {
+                columns.appendAssumeCapacity(.empty);
+            }
+
+            if (csvRowLooksLikeHeader(firstFields.items)) {
+                for (firstFields.items) |name| {
+                    try columnNames.append(gpa, name);
+                }
+                continue;
+            }
+
+            try appendCsvRow(gpa, &columns, line, lineNo, diagnostic);
+            continue;
+        }
+
+        try appendCsvRow(gpa, &columns, line, lineNo, diagnostic);
+    }
+
+    if (columns.items.len == 0) {
+        diagnostic.* = "CSV file contained no numeric rows";
+        return error.EmptyCsv;
+    }
+
+    var ret: std.ArrayList(Column) = .empty;
+    errdefer {
+        for (ret.items) |*column| column.deinit(gpa);
+        ret.deinit(gpa);
+    }
+    try ret.ensureUnusedCapacity(gpa, columns.items.len);
+
+    for (columns.items, 0..) |*column, i| {
+        const name = if (columnNames.items.len == 0)
+            try std.fmt.allocPrint(gpa, ".column_{d}", .{i})
+        else
+            try makeCsvColumnName(gpa, columnNames.items[i], i, ret.items);
+        errdefer gpa.free(name);
+
+        ret.appendAssumeCapacity(.{
+            .skip = 0,
+            .name = name,
+            .values = try column.toOwnedSlice(gpa),
+        });
+    }
+
+    return ret.toOwnedSlice(gpa);
+}
+
+/// Serialize columns to the v2 debug format. The returned slice is owned by
+/// the caller.
+pub fn writeV2Txt(gpa: Allocator, columns: []const Column, mode: V2OutMode) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+
+    const writer = &out.writer;
+    try writer.print("!v2\nmode={s}\n{}\n", .{ @tagName(mode), columns.len });
+    for (columns) |column| {
+        try writer.print("{s}\n", .{column.name});
+    }
+
+    for (columns) |column| {
+        try writer.print(
+            "{s}\n{}\n{}\n",
+            .{ column.name, column.skip, column.values.len },
+        );
+
+        switch (mode) {
+            .raw => {
+                try writer.writeByte('!');
+                try writer.writeAll(std.mem.sliceAsBytes(column.values));
+                try writer.writeByte('\n');
+            },
+            .human => {
+                for (column.values) |value| {
+                    try writer.print("{d}\n", .{value});
+                }
+            },
+        }
+    }
+
+    return out.toOwnedSlice();
 }
 
 pub fn parseDbgFile(io: std.Io, gpa: Allocator, pageAlloc: Allocator, filename: []const u8, diagnostic: *?[]const u8) ![]Column {
@@ -296,9 +546,10 @@ pub fn parseDbgFile(io: std.Io, gpa: Allocator, pageAlloc: Allocator, filename: 
     defer pageAlloc.free(dbgContents);
 
     const start = std.Io.Clock.awake.now(io);
-    const v = parseDbgOut(gpa, dbgContents, diagnostic) catch |e| {
-        return e;
-    };
+    const v = if (std.mem.endsWith(u8, filename, ".csv"))
+        parseCsv(gpa, dbgContents, diagnostic)
+    else
+        parseDbgOut(gpa, dbgContents, diagnostic);
     const end = std.Io.Clock.awake.now(io);
 
     const nanos: f64 = @floatFromInt(start.durationTo(end).nanoseconds);

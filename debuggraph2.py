@@ -2,15 +2,17 @@
 # requires-python = ">=3.13"
 # dependencies = [
 #     "matplotlib",
+#     "plotly",
 # ]
 # ///
 
 # Wrapper around debuggraph_zig that runs the zig program, reads bare (binary) output
-# from stdout, and converts it to matplotlib graphs.
+# from stdout, and converts it to matplotlib graphs or a single interactive HTML page.
 #
 # Usage:
 #    uv run debuggraph2.py graph <graph_file>
 #    uv run debuggraph2.py plot <json_file>
+#    uv run debuggraph2.py html <graph_file> [more files...] [-o output.html]
 #
 # The zig program outputs a text header (CHART, SAVE, TITLE, x, y labels) followed
 # by raw binary f32 data (little-endian) for each frame, terminated by END.
@@ -22,6 +24,7 @@ import os
 import subprocess
 import struct
 import argparse
+import html as html_lib
 import json
 from pathlib import Path
 
@@ -99,6 +102,8 @@ def _parse_text_header(data: bytes, pos: int):
             meta["title"] = line[6:]
         elif line.startswith("x:"):
             meta["xlabel"] = line[2:]
+        elif line.startswith("ylabel:"):
+            meta["ylabel"] = line[7:]
         elif line.startswith("width:"):
             try:
                 meta["width"] = int(line[6:])
@@ -382,6 +387,7 @@ def parse_bare_output(data: bytes):
                 "title": meta.get("title", ""),
                 "save": meta.get("save", ""),
                 "xlabel": meta.get("xlabel", ""),
+                "ylabel": meta.get("ylabel", ""),
                 "ylabels": meta.get("ylabels", []),
                 "width": meta.get("width", 0),
                 "height": meta.get("height", 0),
@@ -423,6 +429,8 @@ def plot_chart(chart: dict):
         ax.plot(xs, y_vals, label=label)
 
     ax.set_xlabel(chart["xlabel"], fontsize=chart.get("font_xlabel") or None)
+    if chart.get("ylabel"):
+        ax.set_ylabel(chart["ylabel"], fontsize=chart.get("font_ylabel") or None)
     ax.set_title(chart["title"], fontsize=chart.get("font_title") or None)
     ax.legend(prop={"size": chart["font_legend"]} if chart.get("font_legend") else None)
     ax.grid(True)
@@ -495,9 +503,275 @@ def plot_chart(chart: dict):
     plt.close(fig)
 
 
+def _color_with_alpha(color: str, alpha: str | None) -> str:
+    """Apply an alpha value to a hex color when possible."""
+    if not color:
+        return color
+    if alpha is None:
+        return color
+    try:
+        alpha_float = float(alpha)
+    except (TypeError, ValueError):
+        return color
+    if len(color) == 7 and color.startswith("#"):
+        try:
+            red = int(color[1:3], 16)
+            green = int(color[3:5], 16)
+            blue = int(color[5:7], 16)
+        except ValueError:
+            return color
+        return f"rgba({red}, {green}, {blue}, {alpha_float})"
+    return color
+
+
+def _plotly_annotation(ann: dict) -> dict:
+    """Convert one parsed annotation to Plotly annotation arguments."""
+    kwargs = {
+        "x": ann["x"],
+        "y": ann["y"],
+        "xref": "x",
+        "yref": "y",
+        "text": html_lib.escape(ann["text"]).replace("\n", "<br>"),
+    }
+
+    style = ann.get("style") or {}
+    font = {}
+    if "fontsize" in style:
+        try:
+            font["size"] = float(style["fontsize"])
+        except (TypeError, ValueError):
+            pass
+    if "color" in style:
+        font["color"] = style["color"]
+    if font:
+        kwargs["font"] = font
+
+    if "bbox.boxstyle" in style:
+        facecolor = style.get("bbox.facecolor")
+        if facecolor:
+            kwargs["bgcolor"] = _color_with_alpha(facecolor, style.get("bbox.alpha"))
+        kwargs["borderpad"] = 4
+
+    arrow_dx = float(ann["arrow"]["dx"])
+    arrow_dy = float(ann["arrow"]["dy"])
+    if arrow_dx != 0 or arrow_dy != 0:
+        # The .graph arrow offsets are in data units, matching the matplotlib
+        # backend. Use absolute axis references so the arrow stays attached to
+        # the data point while zooming.
+        kwargs.update(
+            {
+                "showarrow": True,
+                "ax": ann["x"] + arrow_dx,
+                "ay": ann["y"] + arrow_dy,
+                "axref": "x",
+                "ayref": "y",
+                "arrowhead": 2,
+                "arrowwidth": 1.2,
+            }
+        )
+        if "color" in style:
+            kwargs["arrowcolor"] = style["color"]
+    else:
+        kwargs["showarrow"] = False
+
+    return kwargs
+
+
+def _chart_to_plotly(chart: dict, index: int):
+    """Build a Plotly figure for one chart."""
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+    frames = chart["frames"]
+    if frames:
+        xs = [frame[0] for frame in frames]
+        ncols = len(frames[0])
+        trace_type = go.Scattergl if len(frames) > 5000 else go.Scatter
+        for i in range(1, ncols):
+            label = (
+                chart["ylabels"][i - 1]
+                if i - 1 < len(chart["ylabels"])
+                else f"y{i - 1}"
+            )
+            ys = [frame[i] for frame in frames]
+            fig.add_trace(
+                trace_type(
+                    x=xs,
+                    y=ys,
+                    mode="lines",
+                    name=label,
+                    line={"width": 2},
+                )
+            )
+
+    height = int((chart.get("height") or 6) * (chart.get("dpi") or 100))
+    layout = {
+        "template": "plotly_white",
+        "autosize": True,
+        "height": max(height, 320),
+        "margin": {"l": 70, "r": 24, "t": 24, "b": 56},
+        "dragmode": "zoom",
+        "hovermode": "x unified",
+        "legend": {
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.02,
+            "xanchor": "right",
+            "x": 1,
+        },
+    }
+
+    xaxis = {}
+    if chart.get("xlabel"):
+        xaxis["title"] = {"text": chart["xlabel"]}
+    if chart.get("font_xlabel"):
+        xaxis.setdefault("title", {})["font"] = {"size": chart["font_xlabel"]}
+    if chart.get("font_tick"):
+        xaxis["tickfont"] = {"size": chart["font_tick"]}
+    if xaxis:
+        layout["xaxis"] = xaxis
+
+    yaxis = {}
+    if chart.get("ylabel"):
+        yaxis["title"] = {"text": chart["ylabel"]}
+    if chart.get("font_ylabel"):
+        yaxis.setdefault("title", {})["font"] = {"size": chart["font_ylabel"]}
+    if chart.get("font_tick"):
+        yaxis["tickfont"] = {"size": chart["font_tick"]}
+    if yaxis:
+        layout["yaxis"] = yaxis
+
+    if chart.get("font_legend"):
+        layout["legend"]["font"] = {"size": chart["font_legend"]}
+
+    fig.update_layout(**layout)
+
+    for ann in chart.get("annotations", []):
+        if not ann.get("text"):
+            continue
+        fig.add_annotation(**_plotly_annotation(ann))
+
+    return fig
+
+
+def write_html_report(
+    charts: list[dict], out_path: str, input_files: list[str]
+) -> Path:
+    """Write all charts and annotations to one self-contained interactive HTML file."""
+    import plotly.io as pio
+    from plotly.offline import get_plotlyjs
+
+    sections = []
+    for i, chart in enumerate(charts):
+        fig = _chart_to_plotly(chart, i)
+        div_id = f"chart-{i}"
+        fragment = pio.to_html(
+            fig,
+            full_html=False,
+            include_plotlyjs=False,
+            div_id=div_id,
+            config={
+                "responsive": True,
+                "scrollZoom": True,
+                "displaylogo": False,
+                "toImageButtonOptions": {
+                    "format": "png",
+                    "filename": f"{Path(input_files[0]).stem}-chart-{i + 1}",
+                },
+            },
+        )
+        heading = chart.get("title", "").strip() or f"Chart {i + 1}"
+        sections.append(
+            f'<section class="chart-card" id="{div_id}-section">\n'
+            f"<h2>{html_lib.escape(heading)}</h2>\n"
+            f"{fragment}\n"
+            "</section>"
+        )
+
+    if not sections:
+        sections.append(
+            '<section class="chart-card"><p>No charts were emitted.</p></section>'
+        )
+
+    source_names = ", ".join(html_lib.escape(Path(path).name) for path in input_files)
+    page_title = f"graphgen: {Path(input_files[0]).stem}"
+    css = """
+:root {
+    --bg: #f3f4f6;
+    --card: #ffffff;
+    --text: #111827;
+    --muted: #6b7280;
+    --border: #e5e7eb;
+}
+* { box-sizing: border-box; }
+body {
+    margin: 0;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+}
+header, main {
+    width: 100%;
+    max-width: 1500px;
+    margin-left: auto;
+    margin-right: auto;
+}
+header { margin-bottom: 20px; }
+h1 { margin: 0 0 6px; font-size: 1.6rem; }
+.hint { margin: 0; color: var(--muted); font-size: 0.9rem; }
+main { display: flex; flex-direction: column; gap: 20px; }
+.chart-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px 18px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+.chart-card h2 { margin: 0 0 8px; font-size: 1.05rem; }
+.plotly-graph-div { width: 100% !important; }
+"""
+
+    document = "\n".join(
+        [
+            "<!DOCTYPE html>",
+            '<html lang="en">',
+            "<head>",
+            '<meta charset="utf-8">',
+            '<meta name="viewport" content="width=device-width, initial-scale=1">',
+            f"<title>{html_lib.escape(page_title)}</title>",
+            "<style>",
+            css,
+            "</style>",
+            "<script>",
+            get_plotlyjs(),
+            "</script>",
+            "</head>",
+            "<body>",
+            "<header>",
+            f"<h1>{html_lib.escape(page_title)}</h1>",
+            f'<p class="hint">Source: {source_names}. '
+            "Drag to zoom, scroll to zoom, double-click to reset.</p>",
+            "</header>",
+            "<main>",
+            "\n".join(sections),
+            "</main>",
+            "</body>",
+            "</html>",
+        ]
+    )
+
+    output = Path(out_path)
+    if output.parent:
+        output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(document, encoding="utf-8")
+    return output
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Plot debug data using debuggraph_zig + matplotlib",
+        description="Plot debug data using debuggraph_zig + matplotlib or HTML",
     )
     sub = parser.add_subparsers(dest="command")
     p = sub.add_parser("graph", help="Plot a .graph file directly")
@@ -506,14 +780,41 @@ def main():
     p = sub.add_parser("plot", help="Plot a JSON config file (or .graph file)")
     p.add_argument("json_file", help="Path to the JSON config or .graph file")
 
-    p = sub.add_parser("resultsof", help="List the output file(s) a JSON config declares")
+    p = sub.add_parser(
+        "html",
+        help="Render one or more inputs to a single interactive HTML report",
+    )
     p.add_argument(
-        "json_file", nargs="?", default="./gthing2.json", help="Path to the JSON config file"
+        "input_files",
+        nargs="+",
+        help="Path(s) to .graph or JSON config files",
+    )
+    p.add_argument(
+        "-o",
+        "--out",
+        dest="out_file",
+        default=None,
+        help="Output HTML path (default: first input with a .html extension)",
     )
 
-    p = sub.add_parser("list_keys", help="List the column/key names in a debug output file")
+    p = sub.add_parser(
+        "resultsof", help="List the output file(s) a JSON config declares"
+    )
     p.add_argument(
-        "debug_file", nargs="?", default="./debug_out.txt", help="Path to the debug output file"
+        "json_file",
+        nargs="?",
+        default="./gthing2.json",
+        help="Path to the JSON config file",
+    )
+
+    p = sub.add_parser(
+        "list_keys", help="List the column/key names in a debug output file"
+    )
+    p.add_argument(
+        "debug_file",
+        nargs="?",
+        default="./debug_out.txt",
+        help="Path to the debug output file",
     )
 
     args = parser.parse_args()
@@ -527,6 +828,23 @@ def main():
         out = run_zig_text("list_keys", os.path.abspath(args.debug_file))
         for line in out.splitlines():
             print(line)
+        return
+
+    if args.command == "html":
+        charts = []
+        for path in args.input_files:
+            if path.endswith(".graph"):
+                print(f"Running debuggraph_zig (graph): {path}")
+                raw = run_zig_graph(path)
+            else:
+                print(f"Running debuggraph_zig (plot): {path}")
+                raw = run_zig(path)
+            charts.extend(parse_bare_output(raw))
+
+        print(f"Found {len(charts)} chart(s)")
+        out_path = args.out_file or str(Path(args.input_files[0]).with_suffix(".html"))
+        saved = write_html_report(charts, out_path, args.input_files)
+        print(f"Saved HTML: {saved}")
         return
 
     if args.command in ("graph", "plot"):

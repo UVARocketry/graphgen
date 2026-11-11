@@ -44,7 +44,12 @@ pub const Graph = struct {
     };
 
     saveto: []const u8,
-    filter: Filter,
+    title: []const u8 = "",
+    ylabel: []const u8 = "",
+    filter: Filter = .{
+        .left = null,
+        .right = null,
+    },
     x: Axis,
     y: []Axis,
     annotation: []Annotation,
@@ -135,6 +140,15 @@ pub fn run(
         maxFrame = @max(maxFrame, col.skip + @as(u32, @intCast(col.values.len)));
     }
 
+    for (bytecode.keyrefNames) |name| {
+        const found = for (cols) |col| {
+            if (std.mem.eql(u8, col.name, name)) break true;
+        } else false;
+        if (!found) {
+            std.log.warn("Field '{s}' not found in '{s}'", .{ name, graphs.use });
+        }
+    }
+
     var renameDiagnostic: ?[]const u8 = null;
     defer if (renameDiagnostic) |message| gpa.free(message);
     bytecode.renameKeyrefs(gpa, names.items, &renameDiagnostic) catch |e| {
@@ -177,8 +191,9 @@ pub fn run(
             .bare, .human => try writer.print(
                 \\CHART
                 \\SAVE:{s}
-                \\TITLE:
+                \\TITLE:{s}
                 \\x:{s}
+                \\ylabel:{s}
                 \\width:0
                 \\height:0
                 \\dpi:0
@@ -188,7 +203,7 @@ pub fn run(
                 \\font.legend:0
                 \\font.tick:0
                 \\
-            , .{ graph.saveto, graph.x.title }),
+            , .{ graph.saveto, graph.title, graph.x.title, graph.ylabel }),
             .none => {},
         }
 
