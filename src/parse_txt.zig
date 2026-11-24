@@ -117,7 +117,7 @@ pub fn parseDbgOut(gpa: Allocator, data: []const u8, diagnostic: *?[]const u8) !
         const frame = parseU32(data[frame_start..pos]);
         pos += 1;
 
-        const key_start = pos;
+        const key_start = pos - 1;
         while (pos < len and data[pos] != ':') : (pos += 1) {}
         const key = data[key_start..pos];
         pos += 1;
@@ -332,14 +332,7 @@ fn appendCsvRow(
         }
 
         const text = std.mem.trim(u8, raw, " \t\r\x00");
-        const value = parseCsvNumber(text) catch {
-            diagnostic.* = try std.fmt.allocPrint(
-                gpa,
-                "Line {d}: invalid number '{s}'",
-                .{ lineNo, text },
-            );
-            return error.InvalidNumber;
-        };
+        const value = parseCsvNumber(text) catch std.math.nan(f32);
         try columns.items[columnIndex].append(gpa, value);
     }
 
@@ -539,7 +532,7 @@ pub fn parseDbgFile(io: std.Io, gpa: Allocator, pageAlloc: Allocator, filename: 
     const stat = try file.stat(io);
     const size = stat.size;
 
-    const buf: []u8 = try pageAlloc.alloc(u8, 1024 * 1024 * 16);
+    const buf: []u8 = &.{};
     var r = file.reader(io, buf);
 
     const dbgContents = try r.interface.readAlloc(pageAlloc, size);
@@ -553,7 +546,7 @@ pub fn parseDbgFile(io: std.Io, gpa: Allocator, pageAlloc: Allocator, filename: 
     const end = std.Io.Clock.awake.now(io);
 
     const nanos: f64 = @floatFromInt(start.durationTo(end).nanoseconds);
-    std.debug.print("Took {}s\n", .{nanos / 1.0e9});
+    std.debug.print("data fetch took {}s\n", .{nanos / 1.0e9});
     return v;
 }
 

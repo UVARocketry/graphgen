@@ -153,6 +153,8 @@ pub const BytecodeOp = packed struct(u8) {
         lte,
         /// POP 2, push nan if s[1] >= s[0], else push s[1]
         lt,
+        /// POP 3, push s[1] if s[0], else push s[2]
+        sp_if,
 
         pub fn isSpecialFn(self: OpTypes) bool {
             const tag = @tagName(self);
@@ -163,6 +165,7 @@ pub const BytecodeOp = packed struct(u8) {
             return switch (self) {
                 .sp_ln, .sp_exp, .sp_sqrt, .sp_abs => 1,
                 .sp_max, .sp_min, .sp_pow => 2,
+                .sp_if => 3,
                 .negate, .plus, .minus, .times, .div, .call, .gte, .gt, .lte, .lt => null,
             };
         }
@@ -826,6 +829,16 @@ pub const BytecodeInterpreter = struct {
                     const left = self.popValue();
                     self.pushValue(left / right);
                 },
+                .sp_if => {
+                    const @"else" = self.popValue();
+                    const real = self.popValue();
+                    const cond = self.popValue();
+                    if (std.math.isNan(cond)) {
+                        self.pushValue(@"else");
+                    } else {
+                        self.pushValue(real);
+                    }
+                },
                 .negate => {
                     const v = self.popValue();
                     self.pushValue(-v);
@@ -960,6 +973,9 @@ pub const BytecodeInterpreter = struct {
                     => {
                         current -= 1;
                     },
+                    .sp_if => {
+                        current -= 2;
+                    },
                     .call => {
                         const T = BytecodeOp.OpTypes.FnCallArgs;
                         const v: T = self.reader.eatType(T);
@@ -1063,6 +1079,30 @@ pub const BytecodeInterpreter = struct {
                 },
                 .plus => {
                     std.debug.print("+\n", .{});
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
+                },
+                .sp_if => {
+                    std.debug.print("if\n", .{});
+                    bytesConsumed += self.printStackAst(
+                        .{
+                            .start = range.start,
+                            .len = range.len - bytesConsumed,
+                        },
+                        indent + 1,
+                    );
                     bytesConsumed += self.printStackAst(
                         .{
                             .start = range.start,

@@ -10,6 +10,7 @@ pub const second = @import("passes/second.zig");
 pub const third = @import("passes/third.zig");
 pub const interpret = @import("passes/interpret.zig");
 pub const graph = @import("backends/graph.zig");
+pub const graph_rl = @import("backends/graph_raylib.zig");
 pub const transformcsv = @import("backends/transformcsv.zig");
 // const Res = @import("parse/types.zig").Graphs;
 pub const parse = @import("parse/parse.zig");

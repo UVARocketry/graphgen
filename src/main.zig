@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const debuggraph_zig = @import("debuggraph_zig");
 const bc = debuggraph_zig.bc;
@@ -11,6 +12,7 @@ const second = debuggraph_zig.second;
 const third = debuggraph_zig.third;
 const interpret = debuggraph_zig.interpret;
 const graph = debuggraph_zig.graph;
+const graph_rl = debuggraph_zig.graph_rl;
 const transformcsv = debuggraph_zig.transformcsv;
 // const Res = @import("parse/types.zig").Graphs;
 const parse = debuggraph_zig.parse;
@@ -343,13 +345,15 @@ fn maxStackUsage(bytecode: *bc.BytecodeInterpreter, graphs: *const graph.Graphs)
             max = @max(max, try bytecode.getMaxStackUsage(annotation.line));
             max = @max(max, try bytecode.getMaxStackUsage(annotation.x));
             max = @max(max, try bytecode.getMaxStackUsage(annotation.y));
-            max = @max(max, try bytecode.getMaxStackUsage(annotation.value));
+            for (annotation.value) |val| {
+                max = @max(max, try bytecode.getMaxStackUsage(val));
+            }
         }
     }
     return max;
 }
 
-pub fn doGraph(
+pub fn doRlgraph(
     io: Io,
     gpa: Allocator,
     pageAlloc: Allocator,
@@ -357,6 +361,13 @@ pub fn doGraph(
     stderr: *Io.Writer,
     args: []const []const u8,
 ) !void {
+    var start = std.Io.Clock.awake.now(io);
+    defer {
+        const end = std.Io.Clock.awake.now(io);
+        const nanos: f32 = @floatFromInt(start.durationTo(end).nanoseconds);
+        std.debug.print("parse + execute took {}s\n", .{nanos / 1.0e9});
+    }
+
     var errorStr: []const u8 = "";
     const subArgs = if (args.len >= 3) args[2..] else &.{};
     const graphArgs = parseGraphArgs(subArgs, &errorStr) catch |e| {
@@ -365,7 +376,7 @@ pub fn doGraph(
     };
 
     const graphContents = try f.readFileToString(io, graphArgs.file, pageAlloc);
-    defer pageAlloc.free(graphContents);
+    defer if (builtin.optimize != .fast) pageAlloc.free(graphContents);
 
     var diagnostic: f.Diagnostic = .{
         .gpa = gpa,
@@ -374,7 +385,7 @@ pub fn doGraph(
         .message = &.{},
         .from = .from(""),
     };
-    defer diagnostic.deinit();
+    defer if (builtin.optimize != .fast) diagnostic.deinit();
 
     errdefer {
         if (diagnostic.message.len != 0) {
@@ -382,8 +393,6 @@ pub fn doGraph(
             stderr.flush() catch {};
         }
     }
-
-    var start = std.Io.Clock.awake.now(io);
 
     var parser: parse.ParserPass1 = .{
         .bytecodeStream = .{
@@ -396,13 +405,21 @@ pub fn doGraph(
         .bytecodeStarts = .empty,
     };
     parser.paramNames = .initBuffer(&parser.paramNameBuf);
-    defer parser.deinit(gpa);
+    defer if (builtin.optimize != .fast) parser.deinit(gpa);
 
+    const parseStart = std.Io.Clock.awake.now(io);
     var parsed = try parser.pass(gpa, graph.Graphs, &diagnostic);
-    defer graph.deinit(gpa, &parsed);
+
+    {
+        const end = std.Io.Clock.awake.now(io);
+        const nanos: f32 = @floatFromInt(parseStart.durationTo(end).nanoseconds);
+        std.debug.print("parse took {}s\n", .{nanos / 1.0e9});
+    }
+
+    defer if (builtin.optimize != .fast) graph.deinit(gpa, &parsed);
 
     var cache: bc.ValueCache = .init();
-    defer cache.deinit(gpa);
+    defer if (builtin.optimize != .fast) cache.deinit(gpa);
 
     var dummyStack: [1]f32 = undefined;
     var bytecode: bc.BytecodeInterpreter = .{
@@ -423,10 +440,138 @@ pub fn doGraph(
         },
     };
 
+    const bcStackStart = std.Io.Clock.awake.now(io);
+
     const stackSize: usize = @max(try maxStackUsage(&bytecode, &parsed), 8);
     const stack = try gpa.alloc(f32, stackSize);
-    defer gpa.free(stack);
+    defer if (builtin.optimize != .fast) gpa.free(stack);
+
+    {
+        const end = std.Io.Clock.awake.now(io);
+        const nanos: f32 = @floatFromInt(bcStackStart.durationTo(end).nanoseconds);
+        std.debug.print("bytecode stack fetch took {}s\n", .{nanos / 1.0e9});
+    }
     bytecode.valueStack = .initBuffer(stack);
+
+    const graphStart = std.Io.Clock.awake.now(io);
+
+    try graph_rl.run(
+        io,
+        gpa,
+        pageAlloc,
+        &parsed,
+        stdout,
+        &bytecode,
+        graphArgs.outputType,
+    );
+    {
+        const end = std.Io.Clock.awake.now(io);
+        const nanos: f32 = @floatFromInt(graphStart.durationTo(end).nanoseconds);
+        std.debug.print("graph backend running took {}s\n", .{nanos / 1.0e9});
+    }
+}
+
+pub fn doGraph(
+    io: Io,
+    gpa: Allocator,
+    pageAlloc: Allocator,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    args: []const []const u8,
+) !void {
+    var start = std.Io.Clock.awake.now(io);
+    defer {
+        const end = std.Io.Clock.awake.now(io);
+        const nanos: f32 = @floatFromInt(start.durationTo(end).nanoseconds);
+        std.debug.print("parse + execute took {}s\n", .{nanos / 1.0e9});
+    }
+
+    var errorStr: []const u8 = "";
+    const subArgs = if (args.len >= 3) args[2..] else &.{};
+    const graphArgs = parseGraphArgs(subArgs, &errorStr) catch |e| {
+        try stdout.print("Error from 'graph' subcommand!\n  {s}\n", .{errorStr});
+        return e;
+    };
+
+    const graphContents = try f.readFileToString(io, graphArgs.file, pageAlloc);
+    defer if (builtin.optimize != .fast) pageAlloc.free(graphContents);
+
+    var diagnostic: f.Diagnostic = .{
+        .gpa = gpa,
+        .extraRefs = .empty,
+        .filename = graphArgs.file,
+        .message = &.{},
+        .from = .from(""),
+    };
+    defer if (builtin.optimize != .fast) diagnostic.deinit();
+
+    errdefer {
+        if (diagnostic.message.len != 0) {
+            diagnostic.print(stderr, graphContents) catch {};
+            stderr.flush() catch {};
+        }
+    }
+
+    var parser: parse.ParserPass1 = .{
+        .bytecodeStream = .{
+            .arr = .empty,
+        },
+        .keyrefTable = .empty,
+        .scope = .empty,
+        .lexer = .init(graphContents),
+        .paramNames = .empty,
+        .bytecodeStarts = .empty,
+    };
+    parser.paramNames = .initBuffer(&parser.paramNameBuf);
+    defer if (builtin.optimize != .fast) parser.deinit(gpa);
+
+    const parseStart = std.Io.Clock.awake.now(io);
+    var parsed = try parser.pass(gpa, graph.Graphs, &diagnostic);
+
+    {
+        const end = std.Io.Clock.awake.now(io);
+        const nanos: f32 = @floatFromInt(parseStart.durationTo(end).nanoseconds);
+        std.debug.print("parse took {}s\n", .{nanos / 1.0e9});
+    }
+
+    defer if (builtin.optimize != .fast) graph.deinit(gpa, &parsed);
+
+    var cache: bc.ValueCache = .init();
+    defer if (builtin.optimize != .fast) cache.deinit(gpa);
+
+    var dummyStack: [1]f32 = undefined;
+    var bytecode: bc.BytecodeInterpreter = .{
+        .keyrefNames = parser.keyrefTable.items,
+        .reader = .{
+            .bytecode = parser.bytecodeStream.arr.items,
+            .pos = 0,
+        },
+        .stackAllocator = .failing,
+        .valueStack = .initBuffer(&dummyStack),
+        .datastoreAllocator = gpa,
+        .store = .{
+            .maxFrame = 0,
+            .leftFrame = .nil,
+            .rightFrame = .nil,
+            .frames = &.{},
+            .cache = &cache,
+        },
+    };
+
+    const bcStackStart = std.Io.Clock.awake.now(io);
+
+    const stackSize: usize = @max(try maxStackUsage(&bytecode, &parsed), 8);
+    const stack = try gpa.alloc(f32, stackSize);
+    defer if (builtin.optimize != .fast) gpa.free(stack);
+
+    {
+        const end = std.Io.Clock.awake.now(io);
+        const nanos: f32 = @floatFromInt(bcStackStart.durationTo(end).nanoseconds);
+        std.debug.print("bytecode stack fetch took {}s\n", .{nanos / 1.0e9});
+    }
+    bytecode.valueStack = .initBuffer(stack);
+
+    const graphStart = std.Io.Clock.awake.now(io);
 
     try graph.run(
         io,
@@ -437,9 +582,11 @@ pub fn doGraph(
         &bytecode,
         graphArgs.outputType,
     );
-    const end = std.Io.Clock.awake.now(io);
-    const nanos: f32 = @floatFromInt(start.durationTo(end).nanoseconds);
-    std.debug.print("parse + execute took {}s\n", .{nanos / 1.0e9});
+    {
+        const end = std.Io.Clock.awake.now(io);
+        const nanos: f32 = @floatFromInt(graphStart.durationTo(end).nanoseconds);
+        std.debug.print("graph backend running took {}s\n", .{nanos / 1.0e9});
+    }
 }
 
 pub fn resultsOf(
@@ -909,6 +1056,9 @@ pub fn main(init: std.process.Init) !void {
         try stdout.flush();
     } else if (std.mem.eql(u8, subcommand, "graph")) {
         try doGraph(io, init.gpa, std.heap.page_allocator, stdout, stderr, args);
+        try stdout.flush();
+    } else if (std.mem.eql(u8, subcommand, "graph-rl")) {
+        try doRlgraph(io, init.gpa, std.heap.page_allocator, stdout, stderr, args);
         try stdout.flush();
     } else if (std.mem.eql(u8, subcommand, "ingest_csv")) {
         try doIngestCsv(io, init.gpa, std.heap.page_allocator, stdout, stderr, args);

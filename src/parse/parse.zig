@@ -621,6 +621,31 @@ pub const ParserPass1 = struct {
             }
         }
 
+        if (!matched and std.mem.eql(u8, "_", keyName)) {
+            matched = true;
+
+            const next = try self.lexer.peekNextToken(diagnostic);
+            var labelName: ?[]const u8 = null;
+            if (next.tp == .valuerefdecl) {
+                _ = try self.lexer.getNextToken(diagnostic);
+                labelName = self.lexer.currentString.?;
+            } else {
+                std.debug.print("Expected valuref declaration after underscore field!\n", .{});
+            }
+
+            const parsed = try self.parseValue(alloc, types.Bytecode, keyRef, diagnostic);
+            if (labelName) |lname| {
+                const scopeIndex = try self.defineScopeItem(
+                    alloc,
+                    lname,
+                    .valueref,
+                    .from(lname),
+                    diagnostic,
+                );
+                self.scope.items[scopeIndex].bytecodeRef = bytecodeRefOf(types.Bytecode, parsed);
+            }
+        }
+
         if (!matched) {
             if (comptime extraFieldsInfo(T)) |Extra| {
                 try self.parseExtraField(alloc, T, Extra, keyName, keyRef, lists, diagnostic);
@@ -887,7 +912,22 @@ pub const ParserPass1 = struct {
             return;
         }
 
-        const scopeIndex = try self.referenceScopeItem(alloc, fnName, .function);
+        const infoOpTypes = @typeInfo(bc.BytecodeOp.OpTypes).@"enum";
+        const specialOp: ?bc.BytecodeOp.OpTypes =
+            inline for (infoOpTypes.field_names, infoOpTypes.field_values) |name, value| {
+                if (std.mem.startsWith(u8, name, "sp_")) {
+                    const start = if (name.len < 3) name.len else 3;
+                    if (std.mem.eql(u8, fnName, name[start..])) {
+                        const op: bc.BytecodeOp.OpTypes = @fromBackingInt(@intCast(value));
+                        break op;
+                    }
+                }
+            } else null;
+
+        const scopeIndex = if (specialOp == null)
+            try self.referenceScopeItem(alloc, fnName, .function)
+        else
+            null;
 
         const lparen = try self.lexer.getNextToken(diagnostic);
 
@@ -917,18 +957,6 @@ pub const ParserPass1 = struct {
         }
 
         var argsCount: u16 = 0;
-
-        const infoOpTypes = @typeInfo(bc.BytecodeOp.OpTypes).@"enum";
-        const specialOp: ?bc.BytecodeOp.OpTypes =
-            inline for (infoOpTypes.field_names, infoOpTypes.field_values) |name, value| {
-                if (std.mem.startsWith(u8, name, "sp_")) {
-                    const start = if (name.len < 3) name.len else 3;
-                    if (std.mem.eql(u8, fnName, name[start..])) {
-                        const op: bc.BytecodeOp.OpTypes = @fromBackingInt(@intCast(value));
-                        break op;
-                    }
-                }
-            } else null;
 
         const expectedCount: ?u16 =
             if (specialOp) |op| op.argCountOf() else null;
@@ -1033,7 +1061,7 @@ pub const ParserPass1 = struct {
         });
         try self.bytecodeStream.addType(bc.BytecodeOp.OpTypes.FnCallArgs, alloc, .{
             .bytecode = .{
-                .start = scopeIndex,
+                .start = scopeIndex.?,
                 .len = 0,
             },
             .argsPassed = argsCount,

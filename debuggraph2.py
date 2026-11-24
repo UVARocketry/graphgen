@@ -15,9 +15,11 @@
 #    uv run debuggraph2.py html <graph_file> [more files...] [-o output.html]
 #
 # The zig program outputs a text header (CHART, SAVE, TITLE, x, y labels) followed
-# by raw binary f32 data (little-endian) for each frame, terminated by END.
+# by raw binary f32 data (little-endian) for each frame. The binary frames are
+# terminated by a 4-byte sentinel (0x7F 0x80 0xAB 0xCD), then the ANNOTATIONS
+# block and END follow as text.
 # This script reads stdout as raw bytes, parses the text header, then reads exact-size
-# binary chunks for each frame.
+# binary chunks for each frame until the sentinel.
 
 import sys
 import os
@@ -33,6 +35,9 @@ ZIG_CWD = os.path.dirname(os.path.abspath(__file__))
 
 ZIG_EXE = os.path.join(ZIG_CWD, "zig-out", "bin", "debuggraph_zig")
 
+# The backend terminates a chart's binary frame data with this 4-byte sentinel.
+BARE_END_SIGNAL = b"\x7f\x80\xab\xcd"
+
 
 def build_zig():
     subprocess.run(
@@ -47,7 +52,6 @@ def run_zig_bare(*args: str) -> bytes:
     result = subprocess.run(
         [ZIG_EXE, *args, "--out=bare"],
         capture_output=True,
-        cwd=ZIG_CWD,
     )
     if result.returncode != 0:
         print(f"debuggraph_zig failed (exit {result.returncode}):", file=sys.stderr)
@@ -316,7 +320,8 @@ def parse_bare_output(data: bytes):
 
     Format per chart:
         Text header:  CHART\nSAVE:...\nTITLE:...\nx:...\n<num_y>\ny:...\n...
-        Binary data:  <(num_y+1) * 4 bytes of little-endian f32>\n  (per frame)
+        Binary data:  <(num_y+1) * 4 bytes of little-endian f32>  (per frame, no newline)
+        End signal:   \x7F\x80\xAB\xCD
         ANNOTATIONS\n<count>\n<annotations>
         END\n
     """
@@ -340,22 +345,15 @@ def parse_bare_output(data: bytes):
 
         frames = []
         while pos < len(data):
+            # The backend ends the binary frame data with a sentinel instead of
+            # newline-separated frames.
+            if data[pos : pos + len(BARE_END_SIGNAL)] == BARE_END_SIGNAL:
+                pos += len(BARE_END_SIGNAL)
+                break
             if pos + frame_bytes > len(data):
-                break
-            # Check for ANNOTATIONS or END
-            if data[pos : pos + 11] == b"ANNOTATIONS":
-                break
-            if data[pos : pos + 3] == b"END":
-                pos = data.find(b"\n", pos)
-                if pos == -1:
-                    pos = len(data)
-                else:
-                    pos += 1
                 break
             raw = data[pos : pos + frame_bytes]
             pos += frame_bytes
-            if pos < len(data) and data[pos : pos + 1] == b"\n":
-                pos += 1
             frames.append(struct.unpack(fmt, raw))
 
         # Parse annotations
