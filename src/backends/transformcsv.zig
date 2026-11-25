@@ -125,16 +125,9 @@ pub fn runColumns(
         needed = @max(needed, try bytecode.getMaxStackUsage(add.value));
     }
 
-    const oldStack = bytecode.valueStack;
-    defer bytecode.valueStack = oldStack;
-    var tempStack: ?[]f32 = null;
-    defer if (tempStack) |stack| gpa.free(stack);
-    if (oldStack.capacity < needed) {
-        tempStack = try gpa.alloc(f32, needed);
-        bytecode.valueStack = .initBuffer(tempStack.?);
-    }
+    const stack: []f32 = try gpa.alloc(f32, needed);
 
-    bytecode.setFilterBounds(item.filter);
+    bytecode.setFilterBounds(item.filter, stack);
 
     // dropped column indices, original columns first then added fields
     var dropped = try std.DynamicBitSet.initEmpty(gpa, cols.len + item.add.len);
@@ -198,7 +191,7 @@ pub fn runColumns(
             if (dropped.isSet(cols.len + j)) continue;
             if (!rowFirst) try writer.writeAll(",");
             rowFirst = false;
-            const value = try bytecode.execRange(add.value, frameNo);
+            const value = bytecode.execRange(add.value, frameNo, stack, 0);
             try writer.print("{d}", .{value});
         }
         try writer.writeAll("\n");

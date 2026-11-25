@@ -255,18 +255,11 @@ pub fn doTransformCsv(
     var cache: bc.ValueCache = .init();
     defer cache.deinit(gpa);
 
-    // transformcsv.run grows the interpreter's stack itself if the filter or
-    // add expressions need more room than this
-    var dummyStack: [1]f32 = undefined;
-
     var bytecode: bc.BytecodeInterpreter = .{
         .keyrefNames = parser.keyrefTable.items,
         .reader = .{
             .bytecode = parser.bytecodeStream.arr.items,
-            .pos = 0,
         },
-        .stackAllocator = .failing,
-        .valueStack = .initBuffer(&dummyStack),
         .datastoreAllocator = gpa,
         .store = .{
             .maxFrame = 0,
@@ -421,15 +414,11 @@ pub fn doRlgraph(
     var cache: bc.ValueCache = .init();
     defer if (builtin.optimize != .fast) cache.deinit(gpa);
 
-    var dummyStack: [1]f32 = undefined;
     var bytecode: bc.BytecodeInterpreter = .{
         .keyrefNames = parser.keyrefTable.items,
         .reader = .{
             .bytecode = parser.bytecodeStream.arr.items,
-            .pos = 0,
         },
-        .stackAllocator = .failing,
-        .valueStack = .initBuffer(&dummyStack),
         .datastoreAllocator = gpa,
         .store = .{
             .maxFrame = 0,
@@ -442,16 +431,11 @@ pub fn doRlgraph(
 
     const bcStackStart = std.Io.Clock.awake.now(io);
 
-    const stackSize: usize = @max(try maxStackUsage(&bytecode, &parsed), 8);
-    const stack = try gpa.alloc(f32, stackSize);
-    defer if (builtin.optimize != .fast) gpa.free(stack);
-
     {
         const end = std.Io.Clock.awake.now(io);
         const nanos: f32 = @floatFromInt(bcStackStart.durationTo(end).nanoseconds);
         std.debug.print("bytecode stack fetch took {}s\n", .{nanos / 1.0e9});
     }
-    bytecode.valueStack = .initBuffer(stack);
 
     const graphStart = std.Io.Clock.awake.now(io);
 
@@ -539,15 +523,11 @@ pub fn doGraph(
     var cache: bc.ValueCache = .init();
     defer if (builtin.optimize != .fast) cache.deinit(gpa);
 
-    var dummyStack: [1]f32 = undefined;
     var bytecode: bc.BytecodeInterpreter = .{
         .keyrefNames = parser.keyrefTable.items,
         .reader = .{
             .bytecode = parser.bytecodeStream.arr.items,
-            .pos = 0,
         },
-        .stackAllocator = .failing,
-        .valueStack = .initBuffer(&dummyStack),
         .datastoreAllocator = gpa,
         .store = .{
             .maxFrame = 0,
@@ -569,7 +549,6 @@ pub fn doGraph(
         const nanos: f32 = @floatFromInt(bcStackStart.durationTo(end).nanoseconds);
         std.debug.print("bytecode stack fetch took {}s\n", .{nanos / 1.0e9});
     }
-    bytecode.valueStack = .initBuffer(stack);
 
     const graphStart = std.Io.Clock.awake.now(io);
 
@@ -673,8 +652,6 @@ pub fn doParse(
     var cache: bc.ValueCache = .init();
     defer cache.deinit(gpa);
 
-    var stackBuffer: [6]f32 = undefined;
-
     var parsed = try parser.pass(gpa, graph.Graphs, &diagnostic);
     defer graph.deinit(gpa, &parsed);
 
@@ -682,10 +659,7 @@ pub fn doParse(
         .keyrefNames = parser.keyrefTable.items,
         .reader = .{
             .bytecode = parser.bytecodeStream.arr.items,
-            .pos = 0,
         },
-        .stackAllocator = .failing,
-        .valueStack = .initBuffer(&stackBuffer),
         .datastoreAllocator = gpa,
         .store = .{
             .maxFrame = 0,
@@ -996,10 +970,7 @@ pub fn cool(
         .keyrefNames = keyrefNames,
         .reader = .{
             .bytecode = builder.arr.items,
-            .pos = 0,
         },
-        .stackAllocator = .failing,
-        .valueStack = .initBuffer(&stackBuffer),
         .datastoreAllocator = gpa,
         .store = .{
             .maxFrame = maxFrame,
@@ -1012,7 +983,7 @@ pub fn cool(
 
     std.debug.print("Stack usage: {}\n", .{try bytecode.getMaxStackUsage(restRef)});
 
-    const value = try bytecode.execRange(restRef, 3);
+    const value = bytecode.execRange(restRef, 3, &stackBuffer, 0);
     try stdout.print("{}\n", .{value});
 }
 

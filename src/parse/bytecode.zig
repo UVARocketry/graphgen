@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("types.zig");
 
 // bytecode format:
@@ -197,23 +198,21 @@ pub const Frame = struct {
 
 pub const OptionalU31 = packed struct(u32) {
     // TODO: this can just be a u32 value where 0 is the null
-    hasval: bool,
-    value: u31,
+    value: u32,
 
     pub const nil: OptionalU31 = .{
-        .hasval = false,
         .value = 0,
     };
 
+    pub fn isNil(self: OptionalU31) bool {
+        return self.value == nil.value;
+    }
     pub fn eql(self: OptionalU31, other: OptionalU31) bool {
         // if they are both nonspecified values, then we consider them equal
-        if (!self.hasval and !other.hasval) {
-            return true;
-        }
         return self.value == other.value;
     }
     pub fn orElse(self: OptionalU31, value: u32) u32 {
-        if (!self.hasval) {
+        if (self.value == nil.value) {
             return value;
         }
         return self.value;
@@ -276,12 +275,10 @@ pub const DataStore = struct {
 
 pub const BytecodeReader = struct {
     bytecode: []const u8,
-    pos: u32,
 
-    pub fn eatOp(self: *BytecodeReader) BytecodeOp {
-        std.debug.assert(self.pos < self.bytecode.len);
-        const value: BytecodeOp = @bitCast(self.bytecode[self.pos]);
-        self.pos += 1;
+    pub fn eatOp(self: *const BytecodeReader, ip: *u32) BytecodeOp {
+        const value: BytecodeOp = @bitCast(self.bytecode[ip.*]);
+        ip.* += 1;
         return value;
     }
 
@@ -302,22 +299,20 @@ pub const BytecodeReader = struct {
             .fn_arg => BytecodeOp.PushTypes.FnArg,
         };
     }
-    pub fn eatPushArgs(self: *BytecodeReader, comptime tp: BytecodeOp.PushTypes.Tp) GetTypeForPush(tp) {
-        return self.eatType(GetTypeForPush(tp));
+    pub fn eatPushArgs(self: *const BytecodeReader, comptime tp: BytecodeOp.PushTypes.Tp, ip: *u32) GetTypeForPush(tp) {
+        return self.eatType(GetTypeForPush(tp), ip);
     }
 
-    pub fn eatType(self: *BytecodeReader, comptime T: type) T {
+    pub fn eatType(self: *const BytecodeReader, comptime T: type, ip: *u32) T {
         comptime if (T == void) {
             return {};
         };
 
         const tSize = @sizeOf(T);
 
-        std.debug.assert(self.pos + tSize <= self.bytecode.len);
+        const slice = self.bytecode[ip.* .. ip.* + tSize];
 
-        const slice = self.bytecode[self.pos .. self.pos + tSize];
-
-        self.pos += tSize;
+        ip.* += tSize;
 
         const v: *align(1) const T = @ptrCast(slice);
 
@@ -341,17 +336,9 @@ pub const BytecodeFilter = struct {
 pub const BytecodeInterpreter = struct {
     reader: BytecodeReader,
     keyrefNames: []const []const u8,
-    valueStack: std.ArrayList(f32),
-    stackAllocator: std.mem.Allocator,
+
     datastoreAllocator: std.mem.Allocator,
     store: DataStore,
-    pub fn popValue(self: *BytecodeInterpreter) f32 {
-        return self.valueStack.pop().?;
-    }
-
-    pub fn pushValue(self: *BytecodeInterpreter, item: f32) void {
-        self.valueStack.append(self.stackAllocator, item) catch @panic("whut whoa");
-    }
 
     /// Remaps every keyref id in the bytecode from an index into the current
     /// `keyrefNames` to an index into `nameTable`, then adopts `nameTable` as the
@@ -417,25 +404,25 @@ pub const BytecodeInterpreter = struct {
         }
 
         const stream = @constCast(self.reader.bytecode);
-        var reader = self.reader;
-        reader.pos = 0;
-        while (reader.pos < reader.bytecode.len) {
-            const op = reader.eatOp();
+        const reader = self.reader;
+        var ip: u32 = 0;
+        while (ip < reader.bytecode.len) {
+            const op = reader.eatOp(&ip);
             if (op.isKeyref) {
                 const tp = op.rest.keyref.tp;
                 if (tp == .keyref) {
-                    const argPos = reader.pos;
-                    const arg = reader.eatPushArgs(.keyref);
+                    const argPos = ip;
+                    const arg = reader.eatPushArgs(.keyref, &ip);
                     if (arg.keyrefId >= indexUpdateTable.len) {
                         diagnostic.* = try alloc.dupe(u8, "keyref id out of range");
                         return error.UnknownKeyref;
                     }
                     stream[argPos] = @intCast(indexUpdateTable[arg.keyrefId]);
                 } else {
-                    reader.pos += BytecodeReader.getTypeSizeForPush(tp);
+                    ip += BytecodeReader.getTypeSizeForPush(tp);
                 }
             } else if (op.rest.operation == .call) {
-                reader.pos += @sizeOf(BytecodeOp.OpTypes.FnCallArgs);
+                ip += @sizeOf(BytecodeOp.OpTypes.FnCallArgs);
             }
         }
 
@@ -458,16 +445,16 @@ pub const BytecodeInterpreter = struct {
     /// Sets the frame window that reductions (axes, keyrefs) operate on by asking
     /// the filters in `filter` where the valid data starts and ends. Both bounds are
     /// resolved against the pre-existing window before either one is stored.
-    pub fn setFilterBounds(self: *BytecodeInterpreter, filter: BytecodeFilter) void {
+    pub fn setFilterBounds(self: *BytecodeInterpreter, filter: BytecodeFilter, stack: []f32) void {
         // both bounds are resolved against the same (unfiltered) window, just
         // like interpret.zig does
         self.store.leftFrame = .nil;
         self.store.rightFrame = .nil;
-        const left = self.resolveFilterBound(true, filter.left);
-        const resolvedRight = self.resolveFilterBound(false, filter.right);
+        const left = self.resolveFilterBound(true, filter.left, stack);
+        const resolvedRight = self.resolveFilterBound(false, filter.right, stack);
         // interpret.zig uses 0 as the "no restriction" sentinel for the right
         // bound, so normalize it back to `.nil` for the rest of the runtime
-        const right: OptionalU31 = if (resolvedRight.hasval and resolvedRight.value == 0)
+        const right: OptionalU31 = if (!resolvedRight.isNil() and resolvedRight.value == 0)
             .nil
         else
             resolvedRight;
@@ -482,6 +469,7 @@ pub const BytecodeInterpreter = struct {
         self: *BytecodeInterpreter,
         findLeft: bool,
         sectionopt: ?BytecodeFilter.FilterSection,
+        stack: []f32,
     ) OptionalU31 {
         if (sectionopt == null) return .nil;
         const section = sectionopt.?;
@@ -494,7 +482,7 @@ pub const BytecodeInterpreter = struct {
 
         // trivial case where the filter already passes at the edge frame
         const edge = if (findLeft) leftFrame else rightFrame - 1;
-        if (!std.math.isNan(self.evalFilter(section.value, edge))) {
+        if (!std.math.isNan(self.evalFilter(section.value, edge, stack))) {
             return .nil;
         }
 
@@ -504,15 +492,13 @@ pub const BytecodeInterpreter = struct {
                 var i: u32 = 0;
                 while (i < rightFrame - leftFrame) : (i += 1) {
                     const realFrame = if (findLeft) leftFrame + i else rightFrame - 1 - i;
-                    if (!std.math.isNan(self.evalFilter(section.value, realFrame))) {
+                    if (!std.math.isNan(self.evalFilter(section.value, realFrame, stack))) {
                         return .{
-                            .hasval = true,
                             .value = @intCast(if (findLeft) realFrame else realFrame + 1),
                         };
                     }
                 }
                 return .{
-                    .hasval = true,
                     .value = @intCast(if (findLeft) rightFrame else leftFrame),
                 };
             },
@@ -522,10 +508,9 @@ pub const BytecodeInterpreter = struct {
                 var i: u32 = 0;
                 while (i < rightFrame - leftFrame) : (i += 1) {
                     const realFrame = if (findLeft) leftFrame + i else rightFrame - 1 - i;
-                    if (!std.math.isNan(self.evalFilter(section.value, realFrame))) {
+                    if (!std.math.isNan(self.evalFilter(section.value, realFrame, stack))) {
                         if (ready) {
                             return .{
-                                .hasval = true,
                                 .value = @intCast(if (findLeft) realFrame else realFrame + 1),
                             };
                         }
@@ -534,7 +519,6 @@ pub const BytecodeInterpreter = struct {
                     }
                 }
                 return .{
-                    .hasval = true,
                     .value = @intCast(if (findLeft) rightFrame else leftFrame),
                 };
             },
@@ -545,26 +529,26 @@ pub const BytecodeInterpreter = struct {
                 var rightBound = rightFrame;
                 while (leftBound < rightBound) {
                     const frame = (leftBound + rightBound) / 2;
-                    const passes = !std.math.isNan(self.evalFilter(section.value, frame));
+                    const passes = !std.math.isNan(self.evalFilter(section.value, frame, stack));
                     if (passes == findLeft) {
                         if (rightBound - leftBound <= 1) {
-                            return .{ .hasval = true, .value = @intCast(leftBound) };
+                            return .{ .value = @intCast(leftBound) };
                         }
                         rightBound = frame;
                     } else {
                         if (rightBound - leftBound <= 1) {
-                            return .{ .hasval = true, .value = @intCast(rightBound) };
+                            return .{ .value = @intCast(rightBound) };
                         }
                         leftBound = frame;
                     }
                 }
-                return .{ .hasval = true, .value = @intCast(leftBound) };
+                return .{ .value = @intCast(leftBound) };
             },
         }
     }
 
-    fn evalFilter(self: *BytecodeInterpreter, ref: BytecodeRef, frameNo: u32) f32 {
-        return self.execRange(ref, frameNo) catch unreachable;
+    fn evalFilter(self: *BytecodeInterpreter, ref: BytecodeRef, frameNo: u32, stack: []f32) f32 {
+        return self.execRange(ref, frameNo, stack, 0);
     }
 
     pub fn analyzeFrame(self: *BytecodeInterpreter, keyref: u32, tp: SaveTypes) f32 {
@@ -654,13 +638,15 @@ pub const BytecodeInterpreter = struct {
         ref: BytecodeRef,
         access: BytecodeOp.PushTypes.AccessType,
         frameNo: u32,
+        stack: []f32,
+        sp: u32,
     ) f32 {
         const nan = std.math.nan(f32);
         switch (access) {
-            .current => return self.execRange(ref, frameNo) catch unreachable,
+            .current => return self.execRange(ref, frameNo, stack, sp),
             .prev => {
                 if (frameNo == 0) return nan;
-                return self.execRange(ref, frameNo - 1) catch unreachable;
+                return self.execRange(ref, frameNo - 1, stack, sp);
             },
             else => {},
         }
@@ -690,7 +676,7 @@ pub const BytecodeInterpreter = struct {
             value = switch (tp) {
                 .first => blk: {
                     for (leftBound..rightBound) |frame| {
-                        const v = self.execRange(ref, @intCast(frame)) catch unreachable;
+                        const v = self.execRange(ref, @intCast(frame), stack, sp);
                         if (!std.math.isNan(v)) break :blk v;
                     }
                     break :blk nan;
@@ -699,7 +685,7 @@ pub const BytecodeInterpreter = struct {
                     var frame = rightBound;
                     while (frame > leftBound) {
                         frame -= 1;
-                        const v = self.execRange(ref, @intCast(frame)) catch unreachable;
+                        const v = self.execRange(ref, @intCast(frame), stack, sp);
                         if (!std.math.isNan(v)) break :blk v;
                     }
                     break :blk nan;
@@ -707,7 +693,7 @@ pub const BytecodeInterpreter = struct {
                 .min, .max => blk: {
                     var val: f32 = nan;
                     for (leftBound..rightBound) |frame| {
-                        const v = self.execRange(ref, @intCast(frame)) catch unreachable;
+                        const v = self.execRange(ref, @intCast(frame), stack, sp);
                         if (std.math.isNan(v)) continue;
                         if (std.math.isNan(val)) {
                             val = v;
@@ -723,7 +709,7 @@ pub const BytecodeInterpreter = struct {
                     var sum: f32 = 0;
                     var count: u32 = 0;
                     for (leftBound..rightBound) |frame| {
-                        const v = self.execRange(ref, @intCast(frame)) catch unreachable;
+                        const v = self.execRange(ref, @intCast(frame), stack, sp);
                         if (std.math.isNan(v)) continue;
                         sum += v;
                         count += 1;
@@ -754,206 +740,187 @@ pub const BytecodeInterpreter = struct {
         return value;
     }
 
-    pub fn execOne(self: *BytecodeInterpreter, frameNo: u32, argBase: u32) void {
-        const op = self.reader.eatOp();
+    pub fn execRange(self: *BytecodeInterpreter, range: BytecodeRef, frameNo: u32, stack: []f32, stackBase: u32) f32 {
+        var sp: u32 = stackBase;
+        var ip: u32 = range.start;
 
-        if (op.isKeyref) {
-            const KeyrefArg = BytecodeOp.PushTypes.KeyrefArg;
-            const FnArg = BytecodeOp.PushTypes.FnArg;
-            switch (op.rest.keyref.tp) {
-                .keyref => {
-                    const v: KeyrefArg = self.reader.eatPushArgs(.keyref);
-                    if (op.rest.keyref.rest.keyref == .current) {
-                        self.pushValue(
-                            self.store.frames[v.keyrefId].valueAtFrame(frameNo),
-                        );
-                    } else if (op.rest.keyref.rest.keyref == .prev) {
-                        self.pushValue(
-                            self.store.frames[v.keyrefId].valueAtFrame(frameNo - 1),
-                        );
-                    } else {
-                        const value = self.analyzeFrame(v.keyrefId, op.rest.keyref.rest.keyref.toSaveType());
-                        self.pushValue(value);
-                    }
-                },
-                .value => {
-                    const v = self.reader.eatPushArgs(.value);
-                    self.pushValue(v);
-                },
-                .axis => {
-                    const v: BytecodeOp.PushTypes.AxisArg = self.reader.eatPushArgs(.axis);
-                    const value = self.analyzeAxis(v, op.rest.keyref.rest.axis, frameNo);
-                    self.pushValue(value);
-                },
-                .fn_arg => {
-                    const argId: FnArg = self.reader.eatPushArgs(.fn_arg);
-                    // help:
-                    // argId is 0, argBase is 0 (no items in stack)
-                    // argId is 0, argBase is 1 (1 item in stack) (valid)
-                    std.debug.assert(argId.argIndex + 1 <= argBase);
+        while (ip < range.start + range.len) {
+            const op = self.reader.eatOp(&ip);
 
-                    const value = self.valueStack.items[argBase - argId.argIndex - 1];
-                    self.pushValue(value);
-                },
-            }
-        } else {
-            switch (op.rest.operation) {
-                .call => {
-                    const T = BytecodeOp.OpTypes.FnCallArgs;
-                    const args: T = self.reader.eatType(T);
+            if (op.isKeyref) {
+                const KeyrefArg = BytecodeOp.PushTypes.KeyrefArg;
+                const FnArg = BytecodeOp.PushTypes.FnArg;
+                switch (op.rest.keyref.tp) {
+                    .keyref => {
+                        const v: KeyrefArg = self.reader.eatPushArgs(.keyref, &ip);
+                        if (op.rest.keyref.rest.keyref == .current) {
+                            stack[sp] = self.store.frames[v.keyrefId].valueAtFrame(frameNo);
+                            sp += 1;
+                        } else if (op.rest.keyref.rest.keyref == .prev) {
+                            stack[sp] =
+                                self.store.frames[v.keyrefId].valueAtFrame(frameNo - 1);
+                            sp += 1;
+                        } else {
+                            const value = self.analyzeFrame(
+                                v.keyrefId,
+                                op.rest.keyref.rest.keyref.toSaveType(),
+                            );
+                            stack[sp] = value;
+                            sp += 1;
+                        }
+                    },
+                    .value => {
+                        const v = self.reader.eatPushArgs(.value, &ip);
+                        stack[sp] = v;
+                        sp += 1;
+                    },
+                    .axis => {
+                        const v: BytecodeOp.PushTypes.AxisArg = self.reader.eatPushArgs(.axis, &ip);
+                        const value = self.analyzeAxis(v, op.rest.keyref.rest.axis, frameNo, stack, sp);
+                        stack[sp] = value;
+                        sp += 1;
+                    },
+                    .fn_arg => {
+                        const argId: FnArg = self.reader.eatPushArgs(.fn_arg, &ip);
+                        // help:
+                        // argId is 0, argBase is 0 (no items in stack)
+                        // argId is 0, argBase is 1 (1 item in stack) (valid)
 
-                    const value = self.execRange(args.bytecode, frameNo) catch unreachable;
+                        const value = stack[stackBase - argId.argIndex - 1];
+                        stack[sp] = value;
+                        sp += 1;
+                    },
+                }
+            } else {
+                switch (op.rest.operation) {
+                    .call => {
+                        const T = BytecodeOp.OpTypes.FnCallArgs;
+                        const args: T = self.reader.eatType(T, &ip);
 
-                    for (0..args.argsPassed) |_| {
-                        _ = self.popValue();
-                    }
-                    self.pushValue(value);
-                },
-                .plus => {
-                    const right = self.popValue();
-                    const left = self.popValue();
-                    self.pushValue(left + right);
-                },
-                .minus => {
-                    const right = self.popValue();
-                    const left = self.popValue();
-                    self.pushValue(left - right);
-                },
-                .times => {
-                    const right = self.popValue();
-                    const left = self.popValue();
-                    self.pushValue(left * right);
-                },
-                .div => {
-                    const right = self.popValue();
-                    const left = self.popValue();
-                    self.pushValue(left / right);
-                },
-                .sp_if => {
-                    const @"else" = self.popValue();
-                    const real = self.popValue();
-                    const cond = self.popValue();
-                    if (std.math.isNan(cond)) {
-                        self.pushValue(@"else");
-                    } else {
-                        self.pushValue(real);
-                    }
-                },
-                .negate => {
-                    const v = self.popValue();
-                    self.pushValue(-v);
-                },
-                .sp_ln => {
-                    const v = self.popValue();
-                    self.pushValue(@log(v));
-                },
-                .sp_exp => {
-                    const v = self.popValue();
-                    self.pushValue(@exp(v));
-                },
-                .sp_sqrt => {
-                    const v = self.popValue();
-                    self.pushValue(@sqrt(v));
-                },
-                .sp_abs => {
-                    const v = self.popValue();
-                    self.pushValue(@abs(v));
-                },
-                .sp_max => {
-                    const right = self.popValue();
-                    const left = self.popValue();
-                    self.pushValue(@max(left, right));
-                },
-                .sp_min => {
-                    const right = self.popValue();
-                    const left = self.popValue();
-                    self.pushValue(@min(left, right));
-                },
-                .sp_pow => {
-                    const right = self.popValue();
-                    const left = self.popValue();
-                    self.pushValue(std.math.pow(f32, left, right));
-                },
-                // the comparison ops only pass s[1] through when the gate holds,
-                // otherwise they push nan (so a nan operand always fails the gate)
-                .gte => {
-                    const right = self.popValue();
-                    const left = self.popValue();
-                    self.pushValue(if (left >= right) left else std.math.nan(f32));
-                },
-                .gt => {
-                    const right = self.popValue();
-                    const left = self.popValue();
-                    self.pushValue(if (left > right) left else std.math.nan(f32));
-                },
-                .lte => {
-                    const right = self.popValue();
-                    const left = self.popValue();
-                    self.pushValue(if (left <= right) left else std.math.nan(f32));
-                },
-                .lt => {
-                    const right = self.popValue();
-                    const left = self.popValue();
-                    self.pushValue(if (left < right) left else std.math.nan(f32));
-                },
+                        const value = self.execRange(args.bytecode, frameNo, stack, sp);
+
+                        sp -= args.argsPassed;
+
+                        stack[sp] = value;
+                        sp += 1;
+                    },
+                    .plus => {
+                        sp -= 1;
+                        stack[sp - 1] += stack[sp];
+                    },
+                    .minus => {
+                        sp -= 1;
+                        stack[sp - 1] -= stack[sp];
+                    },
+                    .times => {
+                        sp -= 1;
+                        stack[sp - 1] *= stack[sp];
+                    },
+                    .div => {
+                        sp -= 1;
+                        stack[sp - 1] /= stack[sp];
+                    },
+                    .sp_if => {
+                        sp -= 2;
+                        const @"else" = stack[sp + 1];
+                        const real = stack[sp];
+                        const cond = stack[sp - 1];
+                        if (std.math.isNan(cond)) {
+                            stack[sp - 1] = @"else";
+                        } else {
+                            stack[sp - 1] = real;
+                        }
+                    },
+                    .negate => {
+                        stack[sp - 1] = -stack[sp - 1];
+                    },
+                    .sp_ln => {
+                        stack[sp - 1] = @log(stack[sp - 1]);
+                    },
+                    .sp_exp => {
+                        stack[sp - 1] = @exp(stack[sp - 1]);
+                    },
+                    .sp_sqrt => {
+                        stack[sp - 1] = @sqrt(stack[sp - 1]);
+                    },
+                    .sp_abs => {
+                        stack[sp - 1] = @abs(stack[sp - 1]);
+                    },
+                    .sp_max => {
+                        sp -= 1;
+                        stack[sp - 1] = @max(stack[sp - 1], stack[sp]);
+                    },
+                    .sp_min => {
+                        sp -= 1;
+                        stack[sp - 1] = @min(stack[sp - 1], stack[sp]);
+                    },
+                    .sp_pow => {
+                        sp -= 1;
+                        const right = stack[sp];
+                        const left = stack[sp - 1];
+                        stack[sp - 1] = std.math.pow(f32, left, right);
+                    },
+                    // the comparison ops only pass s[1] through when the gate holds,
+                    // otherwise they push nan (so a nan operand always fails the gate)
+                    .gte => {
+                        sp -= 1;
+                        const right = stack[sp];
+                        const left = stack[sp - 1];
+                        stack[sp - 1] = if (left >= right) left else std.math.nan(f32);
+                    },
+                    .gt => {
+                        sp -= 1;
+                        const right = stack[sp];
+                        const left = stack[sp - 1];
+                        stack[sp - 1] = if (left > right) left else std.math.nan(f32);
+                    },
+                    .lte => {
+                        sp -= 1;
+                        const right = stack[sp];
+                        const left = stack[sp - 1];
+                        stack[sp - 1] = if (left <= right) left else std.math.nan(f32);
+                    },
+                    .lt => {
+                        sp -= 1;
+                        const right = stack[sp];
+                        const left = stack[sp - 1];
+                        stack[sp - 1] = if (left < right) left else std.math.nan(f32);
+                    },
+                }
             }
         }
-    }
 
-    pub fn execRange(self: *BytecodeInterpreter, range: BytecodeRef, frameNo: u32) !f32 {
-        const stackStart = self.valueStack.items.len;
-
-        const old = self.reader.pos;
-        defer self.reader.pos = old;
-
-        self.reader.pos = range.start;
-        var lastPos: u32 = std.math.maxInt(u32);
-
-        while (self.reader.pos < range.start + range.len) {
-            // std.debug.print("Exec at pos {}\n", .{self.reader.pos});
-            self.execOne(frameNo, @intCast(stackStart));
-            if (self.reader.pos == lastPos) {
-                return std.math.nan(f32);
-            }
-            lastPos = self.reader.pos;
+        if (stackBase + 1 != sp) {
+            @panic("improper stack usage");
         }
 
-        if (self.valueStack.items.len != stackStart + 1) {
-            return error.ImproperStackUsage;
-        }
-
-        const last = self.popValue();
-
-        return last;
+        return stack[sp - 1];
     }
 
     pub fn getMaxStackUsage(self: *BytecodeInterpreter, range: BytecodeRef) !u32 {
         var current: u32 = 0;
         var max: u32 = 0;
 
-        const old = self.reader.pos;
-        defer self.reader.pos = old;
-
-        self.reader.pos = range.start;
+        var ip: u32 = range.start;
         var lastPos: u32 = std.math.maxInt(u32);
 
-        while (self.reader.pos < range.start + range.len) {
-            const op = self.reader.eatOp();
+        while (ip < range.start + range.len) {
+            const op = self.reader.eatOp(&ip);
 
-            if (self.reader.pos == lastPos) {
+            if (ip == lastPos) {
                 return error.hwut;
             }
-            lastPos = self.reader.pos;
+            lastPos = ip;
 
             if (op.isKeyref) {
                 current += 1;
                 max = @max(current, max);
                 if (op.rest.keyref.tp == .axis) {
-                    const ref = self.reader.eatPushArgs(.axis);
+                    const ref = self.reader.eatPushArgs(.axis, &ip);
                     const fnSize = try self.getMaxStackUsage(ref);
                     max = @max(max, current - 1 + fnSize);
                 } else {
-                    self.reader.pos += BytecodeReader.getTypeSizeForPush(op.rest.keyref.tp);
+                    ip += BytecodeReader.getTypeSizeForPush(op.rest.keyref.tp);
                 }
             } else {
                 switch (op.rest.operation) {
@@ -978,7 +945,7 @@ pub const BytecodeInterpreter = struct {
                     },
                     .call => {
                         const T = BytecodeOp.OpTypes.FnCallArgs;
-                        const v: T = self.reader.eatType(T);
+                        const v: T = self.reader.eatType(T, &ip);
                         const fnSize = try self.getMaxStackUsage(v.bytecode);
                         max = @max(max, current + fnSize);
                         current += 1;
@@ -992,9 +959,8 @@ pub const BytecodeInterpreter = struct {
     }
 
     fn printStackAst(self: *BytecodeInterpreter, range: BytecodeRef, indent: u8) u16 {
-        const startPos = self.reader.pos;
-        defer self.reader.pos = startPos;
         var endPos = range.start;
+        var ip: u32 = 0;
 
         var bytesConsumed: u16 = 0;
 
@@ -1017,22 +983,20 @@ pub const BytecodeInterpreter = struct {
             endPos += len;
         }
 
-        self.reader.pos = endPos;
-
-        const op = self.reader.eatOp();
+        const op = self.reader.eatOp(&ip);
 
         for (0..indent) |_| std.debug.print("  ", .{});
         if (op.isKeyref) {
             switch (op.rest.keyref.tp) {
                 .keyref => {
-                    const args = self.reader.eatPushArgs(.keyref);
+                    const args = self.reader.eatPushArgs(.keyref, &ip);
                     std.debug.print("keyref {}:{t}\n", .{
                         args.keyrefId,
                         op.rest.keyref.rest.keyref,
                     });
                 },
                 .axis => {
-                    const args = self.reader.eatPushArgs(.axis);
+                    const args = self.reader.eatPushArgs(.axis, &ip);
                     std.debug.print("axis @ ({}, {}):{t}\n", .{
                         args.start,
                         args.len,
@@ -1040,18 +1004,18 @@ pub const BytecodeInterpreter = struct {
                     });
                 },
                 .value => {
-                    const args = self.reader.eatPushArgs(.value);
+                    const args = self.reader.eatPushArgs(.value, &ip);
                     std.debug.print("value={}\n", .{args});
                 },
                 .fn_arg => {
-                    const args = self.reader.eatPushArgs(.fn_arg);
+                    const args = self.reader.eatPushArgs(.fn_arg, &ip);
                     std.debug.print("argument {}\n", .{args.argIndex});
                 },
             }
         } else {
             switch (op.rest.operation) {
                 .call => {
-                    const args = self.reader.eatType(BytecodeOp.OpTypes.FnCallArgs);
+                    const args = self.reader.eatType(BytecodeOp.OpTypes.FnCallArgs, &ip);
                     std.debug.print("call @ ({}, {}) [{}]\n", .{
                         args.bytecode.start,
                         args.bytecode.len,

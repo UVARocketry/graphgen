@@ -220,12 +220,15 @@ pub fn run(
 
     var frameData: [32]f32 = undefined;
 
+    const stack: []f32 = try gpa.alloc(f32, 128);
+    defer gpa.free(stack);
+
     for (graphs.graph) |*graph| {
         if (graph.y.len > frameData.len - 1) {
             return error.TooManyYValues;
         }
 
-        bytecode.setFilterBounds(graph.filter);
+        bytecode.setFilterBounds(graph.filter, stack);
 
         const frameStart = bytecode.store.leftFrame.orElse(0);
         // 0 (and .nil) means the right filter did not clip anything
@@ -288,14 +291,14 @@ pub fn run(
             if (frame % (graph.skip + 1) != 0) continue;
             const frameNo: u32 = @intCast(frame);
 
-            const x = try bytecode.execRange(graph.x.value, frameNo);
+            const x = bytecode.execRange(graph.x.value, frameNo, stack, 0);
             if (std.math.isNan(x)) continue;
             frameData[0] = x;
 
             var tempmaxY: f32 = -std.math.inf(f32);
             var tempminY: f32 = std.math.inf(f32);
             for (graph.y, 1..) |axis, i| {
-                const y = try bytecode.execRange(axis.value, frameNo);
+                const y = bytecode.execRange(axis.value, frameNo, stack, 0);
                 if (std.math.isNan(y)) continue :frames;
                 tempmaxY = @max(tempmaxY, y);
                 tempminY = @min(tempminY, y);
@@ -311,7 +314,7 @@ pub fn run(
 
             // track the frame each annotation selects from
             for (graph.annotation, stats) |annotation, *stat| {
-                const line = try bytecode.execRange(annotation.line, frameNo);
+                const line = bytecode.execRange(annotation.line, frameNo, stack, 0);
                 if (std.math.isNan(line)) continue;
                 const current: FrameStat = .{ .frame = @intCast(frameNo), .value = line };
                 if (!stat.hasLineData) {
@@ -374,12 +377,12 @@ pub fn run(
                     }
                     const selectedFrame: u32 = @intCast(frame);
 
-                    const x = try bytecode.execRange(annotation.x, selectedFrame);
+                    const x = bytecode.execRange(annotation.x, selectedFrame, stack, 0);
                     if (std.math.isNan(x)) {
                         try writer.print("SKIP\n", .{});
                         continue;
                     }
-                    const y = try bytecode.execRange(annotation.y, selectedFrame);
+                    const y = bytecode.execRange(annotation.y, selectedFrame, stack, 0);
                     if (std.math.isNan(y)) {
                         try writer.print("SKIP\n", .{});
                         continue;
@@ -388,7 +391,7 @@ pub fn run(
                     defer gpa.free(values);
 
                     for (values, annotation.value) |*value, ogVal| {
-                        value.* = try bytecode.execRange(ogVal, selectedFrame);
+                        value.* = bytecode.execRange(ogVal, selectedFrame, stack, 0);
                         if (std.math.isNan(value.*)) {
                             try writer.print("SKIP\n", .{});
                             continue :outer;

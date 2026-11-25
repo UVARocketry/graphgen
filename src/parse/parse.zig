@@ -1720,22 +1720,22 @@ pub const ParserPass1 = struct {
 
         var reader: bc.BytecodeReader = .{
             .bytecode = self.bytecodeStream.arr.items,
-            .pos = 0,
         };
+        var ip: u32 = 0;
 
         // pass to convert all the bytecode into actually executable
         // bytecode (aka resolve all the temporary refs that were left earlier
         // for function calls and axes). properly resolving the keyref values
         // happens later
-        while (reader.pos < reader.bytecode.len) {
-            const op = reader.eatOp();
+        while (ip < reader.bytecode.len) {
+            const op = reader.eatOp(&ip);
             if (op.isKeyref) {
                 switch (op.rest.keyref.tp) {
                     .axis => {
-                        const argPos = reader.pos;
+                        const argPos = ip;
                         const AxisArg = bc.BytecodeReader.GetTypeForPush(.axis);
                         comptime std.debug.assert(AxisArg == bc.BytecodeRef);
-                        const args = reader.eatPushArgs(.axis);
+                        const args = reader.eatPushArgs(.axis, &ip);
 
                         const scopeId = args.start;
 
@@ -1760,16 +1760,16 @@ pub const ParserPass1 = struct {
                         @memcpy(region, value);
                     },
                     else => {
-                        reader.pos += bc.BytecodeReader.getTypeSizeForPush(op.rest.keyref.tp);
+                        ip += bc.BytecodeReader.getTypeSizeForPush(op.rest.keyref.tp);
                     },
                 }
             } else {
                 switch (op.rest.operation) {
                     .call => {
-                        const argPos = reader.pos;
+                        const argPos = ip;
 
                         const A = bc.BytecodeOp.OpTypes.FnCallArgs;
-                        const args = reader.eatType(A);
+                        const args = reader.eatType(A, &ip);
 
                         const scopeId = args.bytecode.start;
 
