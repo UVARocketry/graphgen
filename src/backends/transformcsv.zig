@@ -126,6 +126,11 @@ pub fn runColumns(
     }
 
     const stack: []f32 = try gpa.alloc(f32, needed);
+    defer gpa.free(stack);
+    const batchStack: []f32 = try gpa.alloc(f32, needed * bc.batch_len);
+    defer gpa.free(batchStack);
+    const addSeries: []f32 = try gpa.alloc(f32, item.add.len * bc.batch_len);
+    defer gpa.free(addSeries);
 
     bytecode.setFilterBounds(item.filter, stack);
 
@@ -177,24 +182,42 @@ pub fn runColumns(
     const frameEnd = if (rightFrame == 0) maxFrame else @min(rightFrame, maxFrame);
 
     // every frame in the filter window gets a row, none are skipped
-    for (frameStart..frameEnd) |frame| {
-        const frameNo: u32 = @intCast(frame);
-        var rowFirst = true;
-        for (cols, 0..) |col, i| {
-            if (dropped.isSet(i)) continue;
-            if (!rowFirst) try writer.writeAll(",");
-            rowFirst = false;
-            const asFrame: bc.Frame = .{ .skip = col.skip, .values = col.values };
-            try writer.print("{d}", .{asFrame.valueAtFrame(frameNo)});
-        }
+    const batchU32: u32 = @intCast(bc.batch_len);
+    var chunkStart = frameStart;
+    while (chunkStart < frameEnd) : (chunkStart +|= batchU32) {
+        const chunkEnd = @min(frameEnd, chunkStart +| batchU32);
+        const chunkCount: usize = @intCast(chunkEnd - chunkStart);
+
         for (item.add, 0..) |add, j| {
-            if (dropped.isSet(cols.len + j)) continue;
-            if (!rowFirst) try writer.writeAll(",");
-            rowFirst = false;
-            const value = bytecode.execRange(add.value, frameNo, stack, 0);
-            try writer.print("{d}", .{value});
+            const off = j * bc.batch_len;
+            bytecode.execRangeBatch(
+                add.value,
+                chunkStart,
+                addSeries[off..][0..bc.batch_len],
+                batchStack,
+                0,
+            );
         }
-        try writer.writeAll("\n");
+
+        for (0..chunkCount) |lane| {
+            const frameNo: u32 = chunkStart + @as(u32, @intCast(lane));
+            var rowFirst = true;
+            for (cols, 0..) |col, i| {
+                if (dropped.isSet(i)) continue;
+                if (!rowFirst) try writer.writeAll(",");
+                rowFirst = false;
+                const asFrame: bc.Frame = .{ .skip = col.skip, .values = col.values };
+                try writer.print("{d}", .{asFrame.valueAtFrame(frameNo)});
+            }
+            for (item.add, 0..) |_, j| {
+                if (dropped.isSet(cols.len + j)) continue;
+                if (!rowFirst) try writer.writeAll(",");
+                rowFirst = false;
+                const value = addSeries[j * bc.batch_len + lane];
+                try writer.print("{d}", .{value});
+            }
+            try writer.writeAll("\n");
+        }
     }
 }
 
@@ -242,13 +265,10 @@ test "transform csv columns" {
     var cache: bc.ValueCache = .init();
     defer cache.deinit(gpa);
 
-    var stackBuffer: [1]f32 = undefined;
 
     var bytecode: bc.BytecodeInterpreter = .{
         .keyrefNames = parser.keyrefTable.items,
-        .reader = .{ .bytecode = parser.bytecodeStream.arr.items, .pos = 0 },
-        .stackAllocator = .failing,
-        .valueStack = .initBuffer(&stackBuffer),
+        .reader = .{ .bytecode = parser.bytecodeStream.arr.items },
         .datastoreAllocator = gpa,
         .store = .{
             .maxFrame = 0,
@@ -312,13 +332,10 @@ test "transform drop unknown column" {
     var cache: bc.ValueCache = .init();
     defer cache.deinit(gpa);
 
-    var stackBuffer: [1]f32 = undefined;
 
     var bytecode: bc.BytecodeInterpreter = .{
         .keyrefNames = parser.keyrefTable.items,
-        .reader = .{ .bytecode = parser.bytecodeStream.arr.items, .pos = 0 },
-        .stackAllocator = .failing,
-        .valueStack = .initBuffer(&stackBuffer),
+        .reader = .{ .bytecode = parser.bytecodeStream.arr.items },
         .datastoreAllocator = gpa,
         .store = .{
             .maxFrame = 0,
@@ -379,13 +396,10 @@ test "transform missing key" {
     var cache: bc.ValueCache = .init();
     defer cache.deinit(gpa);
 
-    var stackBuffer: [1]f32 = undefined;
 
     var bytecode: bc.BytecodeInterpreter = .{
         .keyrefNames = parser.keyrefTable.items,
-        .reader = .{ .bytecode = parser.bytecodeStream.arr.items, .pos = 0 },
-        .stackAllocator = .failing,
-        .valueStack = .initBuffer(&stackBuffer),
+        .reader = .{ .bytecode = parser.bytecodeStream.arr.items },
         .datastoreAllocator = gpa,
         .store = .{
             .maxFrame = 0,

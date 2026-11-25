@@ -197,7 +197,6 @@ pub const Frame = struct {
 };
 
 pub const OptionalU31 = packed struct(u32) {
-    // TODO: this can just be a u32 value where 0 is the null
     value: u32,
 
     pub const nil: OptionalU31 = .{
@@ -332,6 +331,127 @@ pub const BytecodeFilter = struct {
     left: ?FilterSection,
     right: ?FilterSection,
 };
+
+/// Number of frames evaluated together by the batched interpreter.
+pub const batch_len: usize = 128;
+const vec_len: usize = std.simd.suggestVectorLength(f32).?;
+const Vec = @Vector(vec_len, f32);
+
+inline fn slotSlice(stack: []f32, slot: u32) []f32 {
+    const start = @as(usize, slot) * batch_len;
+    return stack[start..][0..batch_len];
+}
+
+inline fn loadVec(src: []const f32, i: usize) Vec {
+    return @as(*align(1) const Vec, @ptrCast(&src[i])).*;
+}
+
+inline fn storeVec(dst: []f32, i: usize, v: Vec) void {
+    @as(*align(1) Vec, @ptrCast(&dst[i])).* = v;
+}
+
+fn fillFrameColumn(out: []f32, frame: *const Frame, startFrame: i64) void {
+    const nan = std.math.nan(f32);
+    @memset(out, nan);
+
+    const forcedLeft: i64 = @intCast(frame.skip);
+    const forcedRight: i64 = forcedLeft + @as(i64, @intCast(frame.values.len));
+    const lo = @max(startFrame, forcedLeft);
+    const hi = @min(startFrame + @as(i64, @intCast(out.len)), forcedRight);
+    if (lo >= hi) return;
+
+    const outOff: usize = @intCast(lo - startFrame);
+    const srcOff: usize = @intCast(lo - forcedLeft);
+    const n: usize = @intCast(hi - lo);
+    @memcpy(out[outOff..][0..n], frame.values[srcOff..][0..n]);
+}
+
+fn fillScalar(out: []f32, value: f32) void {
+    @memset(out, value);
+}
+
+fn maskNegativeFrames(out: []f32, startFrame: i64) void {
+    if (startFrame >= 0) return;
+    const n = @min(out.len, @as(usize, @intCast(-startFrame)));
+    @memset(out[0..n], std.math.nan(f32));
+}
+
+fn maskAxisPrev(out: []f32, startFrame: i64) void {
+    if (startFrame > 0) return;
+    const n = @min(out.len, @as(usize, @intCast(1 - startFrame)));
+    @memset(out[0..n], std.math.nan(f32));
+}
+
+const BinaryOp = enum { add, sub, mul, div, max, min };
+
+inline fn binaryVec(dst: []f32, a: []const f32, b: []const f32, comptime op: BinaryOp) void {
+    var i: usize = 0;
+    while (i < batch_len) : (i += vec_len) {
+        const av = loadVec(a, i);
+        const bv = loadVec(b, i);
+        const r = switch (op) {
+            .add => av + bv,
+            .sub => av - bv,
+            .mul => av * bv,
+            .div => av / bv,
+            .max => @max(av, bv),
+            .min => @min(av, bv),
+        };
+        storeVec(dst, i, r);
+    }
+}
+
+const UnaryOp = enum { neg, ln, exp, sqrt, abs };
+
+inline fn unaryVec(dst: []f32, a: []const f32, comptime op: UnaryOp) void {
+    var i: usize = 0;
+    while (i < batch_len) : (i += vec_len) {
+        const av = loadVec(a, i);
+        const r = switch (op) {
+            .neg => -av,
+            .ln => @log(av),
+            .exp => @exp(av),
+            .sqrt => @sqrt(av),
+            .abs => @abs(av),
+        };
+        storeVec(dst, i, r);
+    }
+}
+
+const CompareOp = enum { gte, gt, lte, lt };
+
+inline fn compareVec(dst: []f32, a: []const f32, b: []const f32, comptime op: CompareOp) void {
+    const nanVec: Vec = @splat(std.math.nan(f32));
+    var i: usize = 0;
+    while (i < batch_len) : (i += vec_len) {
+        const av = loadVec(a, i);
+        const bv = loadVec(b, i);
+        const mask = switch (op) {
+            .gte => av >= bv,
+            .gt => av > bv,
+            .lte => av <= bv,
+            .lt => av < bv,
+        };
+        storeVec(dst, i, @select(f32, mask, av, nanVec));
+    }
+}
+
+inline fn selectIfVec(dst: []f32, cond: []const f32, real: []const f32, otherwise: []const f32) void {
+    var i: usize = 0;
+    while (i < batch_len) : (i += vec_len) {
+        const cv = loadVec(cond, i);
+        const rv = loadVec(real, i);
+        const ev = loadVec(otherwise, i);
+        const isNan = cv != cv;
+        storeVec(dst, i, @select(f32, isNan, ev, rv));
+    }
+}
+
+fn powVec(dst: []f32, a: []const f32, b: []const f32) void {
+    for (dst, a, b) |*d, av, bv| {
+        d.* = std.math.pow(f32, av, bv);
+    }
+}
 
 pub const BytecodeInterpreter = struct {
     reader: BytecodeReader,
@@ -897,6 +1017,340 @@ pub const BytecodeInterpreter = struct {
         return stack[sp - 1];
     }
 
+    /// Evaluates `range` for `batch_len` consecutive frames starting at `frameStart`.
+    /// The result is written to `out`, which must be at least `batch_len` long.
+    /// `stack` is scratch space of at least `max_stack * batch_len` floats.
+    pub fn execRangeBatch(
+        self: *BytecodeInterpreter,
+        range: BytecodeRef,
+        frameStart: u32,
+        out: []f32,
+        stack: []f32,
+        baseSlot: u32,
+    ) void {
+        self.execBatchSlot(range, @intCast(frameStart), stack, baseSlot);
+        const src = slotSlice(stack, baseSlot);
+        const n = @min(out.len, batch_len);
+        @memcpy(out[0..n], src[0..n]);
+    }
+
+    fn execBatchSlot(
+        self: *BytecodeInterpreter,
+        range: BytecodeRef,
+        frameStart: i64,
+        stack: []f32,
+        baseSlot: u32,
+    ) void {
+        var sp: u32 = baseSlot;
+        var ip: u32 = range.start;
+
+        while (ip < range.start + range.len) {
+            const op = self.reader.eatOp(&ip);
+
+            if (op.isKeyref) {
+                const KeyrefArg = BytecodeOp.PushTypes.KeyrefArg;
+                const FnArg = BytecodeOp.PushTypes.FnArg;
+                switch (op.rest.keyref.tp) {
+                    .keyref => {
+                        const v: KeyrefArg = self.reader.eatPushArgs(.keyref, &ip);
+                        const dst = slotSlice(stack, sp);
+                        const access = op.rest.keyref.rest.keyref;
+                        switch (access) {
+                            .current => fillFrameColumn(dst, &self.store.frames[v.keyrefId], frameStart),
+                            .prev => fillFrameColumn(dst, &self.store.frames[v.keyrefId], frameStart - 1),
+                            else => {
+                                const value = self.analyzeFrame(v.keyrefId, access.toSaveType());
+                                fillScalar(dst, value);
+                            },
+                        }
+                        sp += 1;
+                    },
+                    .value => {
+                        const v = self.reader.eatPushArgs(.value, &ip);
+                        fillScalar(slotSlice(stack, sp), v);
+                        sp += 1;
+                    },
+                    .axis => {
+                        const v: BytecodeOp.PushTypes.AxisArg = self.reader.eatPushArgs(.axis, &ip);
+                        const access = op.rest.keyref.rest.axis;
+                        switch (access) {
+                            .current => {
+                                self.execBatchSlot(v, frameStart, stack, sp);
+                                if (frameStart < 0) {
+                                    maskNegativeFrames(slotSlice(stack, sp), frameStart);
+                                }
+                            },
+                            .prev => {
+                                self.execBatchSlot(v, frameStart - 1, stack, sp);
+                                maskAxisPrev(slotSlice(stack, sp), frameStart);
+                            },
+                            else => {
+                                const value = self.analyzeAxisBatch(v, access, stack, sp);
+                                fillScalar(slotSlice(stack, sp), value);
+                            },
+                        }
+                        sp += 1;
+                    },
+                    .fn_arg => {
+                        const argId: FnArg = self.reader.eatPushArgs(.fn_arg, &ip);
+                        const srcSlot: u32 = baseSlot - @as(u32, argId.argIndex) - 1;
+                        @memcpy(slotSlice(stack, sp), slotSlice(stack, srcSlot));
+                        sp += 1;
+                    },
+                }
+            } else {
+                switch (op.rest.operation) {
+                    .call => {
+                        const T = BytecodeOp.OpTypes.FnCallArgs;
+                        const args: T = self.reader.eatType(T, &ip);
+
+                        self.execBatchSlot(args.bytecode, frameStart, stack, sp);
+
+                        const passed: u32 = args.argsPassed;
+                        if (passed != 0) {
+                            @memcpy(slotSlice(stack, sp - passed), slotSlice(stack, sp));
+                        }
+                        sp = sp - passed + 1;
+                    },
+                    .plus => {
+                        sp -= 1;
+                        binaryVec(
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp),
+                            .add,
+                        );
+                    },
+                    .minus => {
+                        sp -= 1;
+                        binaryVec(
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp),
+                            .sub,
+                        );
+                    },
+                    .times => {
+                        sp -= 1;
+                        binaryVec(
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp),
+                            .mul,
+                        );
+                    },
+                    .div => {
+                        sp -= 1;
+                        binaryVec(
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp),
+                            .div,
+                        );
+                    },
+                    .sp_if => {
+                        sp -= 2;
+                        selectIfVec(
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp),
+                            slotSlice(stack, sp + 1),
+                        );
+                    },
+                    .negate => {
+                        unaryVec(slotSlice(stack, sp - 1), slotSlice(stack, sp - 1), .neg);
+                    },
+                    .sp_ln => {
+                        unaryVec(slotSlice(stack, sp - 1), slotSlice(stack, sp - 1), .ln);
+                    },
+                    .sp_exp => {
+                        unaryVec(slotSlice(stack, sp - 1), slotSlice(stack, sp - 1), .exp);
+                    },
+                    .sp_sqrt => {
+                        unaryVec(slotSlice(stack, sp - 1), slotSlice(stack, sp - 1), .sqrt);
+                    },
+                    .sp_abs => {
+                        unaryVec(slotSlice(stack, sp - 1), slotSlice(stack, sp - 1), .abs);
+                    },
+                    .sp_max => {
+                        sp -= 1;
+                        binaryVec(
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp),
+                            .max,
+                        );
+                    },
+                    .sp_min => {
+                        sp -= 1;
+                        binaryVec(
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp),
+                            .min,
+                        );
+                    },
+                    .sp_pow => {
+                        sp -= 1;
+                        powVec(slotSlice(stack, sp - 1), slotSlice(stack, sp - 1), slotSlice(stack, sp));
+                    },
+                    .gte => {
+                        sp -= 1;
+                        compareVec(
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp),
+                            .gte,
+                        );
+                    },
+                    .gt => {
+                        sp -= 1;
+                        compareVec(
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp),
+                            .gt,
+                        );
+                    },
+                    .lte => {
+                        sp -= 1;
+                        compareVec(
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp),
+                            .lte,
+                        );
+                    },
+                    .lt => {
+                        sp -= 1;
+                        compareVec(
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp - 1),
+                            slotSlice(stack, sp),
+                            .lt,
+                        );
+                    },
+                }
+            }
+        }
+
+        std.debug.assert(sp == baseSlot + 1);
+    }
+
+    fn analyzeAxisBatch(
+        self: *BytecodeInterpreter,
+        ref: BytecodeRef,
+        access: BytecodeOp.PushTypes.AccessType,
+        stack: []f32,
+        baseSlot: u32,
+    ) f32 {
+        const nan = std.math.nan(f32);
+        const tp = access.toSaveType();
+        const batchU32: u32 = @intCast(batch_len);
+
+        const arrPtr = self.store.cache.map.getPtr(tp).?;
+        for (arrPtr.items) |item| {
+            if (item.derivedFrom.isKeyref) continue;
+            const cached = item.derivedFrom.rest.bytecodeRef;
+            if (cached.start != ref.start or cached.len != ref.len) continue;
+            if (item.leftFrame.eql(self.store.leftFrame) and
+                item.rightFrame.eql(self.store.rightFrame))
+            {
+                return item.value;
+            }
+        }
+
+        const leftBound = self.store.leftFrame.orElse(0);
+        const rightBound = @min(
+            self.store.rightFrame.orElse(self.store.maxFrame),
+            self.store.maxFrame,
+        );
+
+        var value: f32 = nan;
+        if (leftBound < rightBound) {
+            value = switch (tp) {
+                .first => blk: {
+                    var frame = leftBound;
+                    while (frame < rightBound) : (frame += batchU32) {
+                        self.execBatchSlot(ref, @intCast(frame), stack, baseSlot);
+                        for (slotSlice(stack, baseSlot)) |v| {
+                            if (!std.math.isNan(v)) break :blk v;
+                        }
+                    }
+                    break :blk nan;
+                },
+                .last => blk: {
+                    var end = rightBound;
+                    while (end > leftBound) {
+                        const start = if (end - leftBound > batchU32) end - batchU32 else leftBound;
+                        self.execBatchSlot(ref, @intCast(start), stack, baseSlot);
+                        const vals = slotSlice(stack, baseSlot);
+                        var i: usize = @intCast(end - start);
+                        while (i > 0) {
+                            i -= 1;
+                            const v = vals[i];
+                            if (!std.math.isNan(v)) break :blk v;
+                        }
+                        end = start;
+                    }
+                    break :blk nan;
+                },
+                .min, .max => blk: {
+                    var val: f32 = nan;
+                    var frame = leftBound;
+                    while (frame < rightBound) : (frame += batchU32) {
+                        self.execBatchSlot(ref, @intCast(frame), stack, baseSlot);
+                        for (slotSlice(stack, baseSlot)) |v| {
+                            if (std.math.isNan(v)) continue;
+                            if (std.math.isNan(val)) {
+                                val = v;
+                            } else if (tp == .min) {
+                                val = @min(val, v);
+                            } else {
+                                val = @max(val, v);
+                            }
+                        }
+                    }
+                    break :blk val;
+                },
+                .mean => blk: {
+                    var sum: f32 = 0;
+                    var count: u32 = 0;
+                    var frame = leftBound;
+                    while (frame < rightBound) : (frame += batchU32) {
+                        self.execBatchSlot(ref, @intCast(frame), stack, baseSlot);
+                        for (slotSlice(stack, baseSlot)) |v| {
+                            if (std.math.isNan(v)) continue;
+                            sum += v;
+                            count += 1;
+                        }
+                    }
+                    if (count == 0) break :blk nan;
+                    break :blk sum / @as(f32, @floatFromInt(count));
+                },
+            };
+        }
+
+        if (ref.len <= std.math.maxInt(u15)) {
+            const save: SavedValue = .{
+                .derivedFrom = .{
+                    .isKeyref = false,
+                    .rest = .{
+                        .bytecodeRef = .{
+                            .start = ref.start,
+                            .len = @intCast(ref.len),
+                        },
+                    },
+                },
+                .leftFrame = self.store.leftFrame,
+                .rightFrame = self.store.rightFrame,
+                .value = value,
+            };
+            arrPtr.append(self.datastoreAllocator, save) catch {};
+        }
+        return value;
+    }
+
     pub fn getMaxStackUsage(self: *BytecodeInterpreter, range: BytecodeRef) !u32 {
         var current: u32 = 0;
         var max: u32 = 0;
@@ -1370,13 +1824,11 @@ fn runAxisTestCase(
     var cache: ValueCache = .init();
     defer cache.deinit(alloc);
 
-    var stackBuffer: [16]f32 = undefined;
+    var stack: [16]f32 = undefined;
 
     var interp: BytecodeInterpreter = .{
         .keyrefNames = &.{},
-        .reader = .{ .bytecode = builder.arr.items, .pos = 0 },
-        .valueStack = .initBuffer(&stackBuffer),
-        .stackAllocator = alloc,
+        .reader = .{ .bytecode = builder.arr.items },
         .datastoreAllocator = alloc,
         .store = .{
             .frames = &frames,
@@ -1390,9 +1842,9 @@ fn runAxisTestCase(
     // const usage = try interp.getMaxStackUsage(mainRef);
     // std.debug.print("max stack usage for access {t}: {}\n", .{ access, usage });
 
-    const v = try interp.execRange(mainRef, frameNo);
+    const v = interp.execRange(mainRef, frameNo, &stack, 0);
     // second run should hit the cache (except for current/prev)
-    const v2 = try interp.execRange(mainRef, frameNo);
+    const v2 = interp.execRange(mainRef, frameNo, &stack, 0);
     try std.testing.expect(v == v2 or std.math.isNan(v));
     return v;
 }
@@ -1428,8 +1880,8 @@ test "axis reductions skip nan frames" {
 test "axis reductions respect frame window" {
     const alloc = std.testing.allocator;
     const vals = [_]f32{ 3, 1, 4, 1, 5 };
-    const left: OptionalU31 = .{ .hasval = true, .value = 2 };
-    const right: OptionalU31 = .{ .hasval = true, .value = 4 };
+    const left: OptionalU31 = .{ .value = 2 };
+    const right: OptionalU31 = .{ .value = 4 };
 
     try std.testing.expectEqual(@as(f32, 8), try runAxisTestCase(alloc, .first, 0, &vals, left, right));
     try std.testing.expectEqual(@as(f32, 2), try runAxisTestCase(alloc, .last, 0, &vals, left, right));
@@ -1440,7 +1892,7 @@ test "axis reductions respect frame window" {
 test "empty window is nan" {
     const alloc = std.testing.allocator;
     const vals = [_]f32{3};
-    const left: OptionalU31 = .{ .hasval = true, .value = 1 };
+    const left: OptionalU31 = .{ .value = 1 };
     try std.testing.expect(std.math.isNan(
         try runAxisTestCase(alloc, .mean, 0, &vals, left, .nil),
     ));
@@ -1467,13 +1919,11 @@ fn runOpExpr(alloc: std.mem.Allocator, op: BytecodeOp.OpTypes, args: []const f32
     var cache: ValueCache = .init();
     defer cache.deinit(alloc);
 
-    var stackBuffer: [8]f32 = undefined;
+    var stack: [8]f32 = undefined;
 
     var interp: BytecodeInterpreter = .{
         .keyrefNames = &.{},
-        .reader = .{ .bytecode = builder.arr.items, .pos = 0 },
-        .valueStack = .initBuffer(&stackBuffer),
-        .stackAllocator = alloc,
+        .reader = .{ .bytecode = builder.arr.items },
         .datastoreAllocator = alloc,
         .store = .{
             .frames = &.{},
@@ -1484,7 +1934,7 @@ fn runOpExpr(alloc: std.mem.Allocator, op: BytecodeOp.OpTypes, args: []const f32
         },
     };
 
-    return try interp.execRange(ref, 0);
+    return interp.execRange(ref, 0, &stack, 0);
 }
 
 test "math operations" {
@@ -1573,13 +2023,9 @@ fn runFilterCase(
     var cache: ValueCache = .init();
     defer cache.deinit(alloc);
 
-    var stackBuffer: [8]f32 = undefined;
-
     var interp: BytecodeInterpreter = .{
         .keyrefNames = &.{},
-        .reader = .{ .bytecode = builder.arr.items, .pos = 0 },
-        .valueStack = .initBuffer(&stackBuffer),
-        .stackAllocator = alloc,
+        .reader = .{ .bytecode = builder.arr.items },
         .datastoreAllocator = alloc,
         .store = .{
             .frames = &frames,
@@ -1600,10 +2046,10 @@ fn runFilterCase(
 
 fn expectBound(bound: OptionalU31, expected: ?u32) !void {
     if (expected) |e| {
-        try std.testing.expect(bound.hasval);
+        try std.testing.expect(!bound.isNil());
         try std.testing.expectEqual(e, @as(u32, bound.value));
     } else {
-        try std.testing.expect(!bound.hasval);
+        try std.testing.expect(bound.isNil());
     }
 }
 
@@ -1678,13 +2124,9 @@ test "renameKeyrefs remaps keyref ids and adopts the new names" {
     var cache: ValueCache = .init();
     defer cache.deinit(alloc);
 
-    var stackBuffer: [8]f32 = undefined;
-
     var interp: BytecodeInterpreter = .{
         .keyrefNames = &oldNames,
-        .reader = .{ .bytecode = builder.arr.items, .pos = 0 },
-        .valueStack = .initBuffer(&stackBuffer),
-        .stackAllocator = alloc,
+        .reader = .{ .bytecode = builder.arr.items },
         .datastoreAllocator = alloc,
         .store = .{
             .frames = &.{},
@@ -1722,13 +2164,9 @@ test "renameKeyrefs reports a keyref missing from the old names" {
     var cache: ValueCache = .init();
     defer cache.deinit(alloc);
 
-    var stackBuffer: [8]f32 = undefined;
-
     var interp: BytecodeInterpreter = .{
         .keyrefNames = &oldNames,
-        .reader = .{ .bytecode = builder.arr.items, .pos = 0 },
-        .valueStack = .initBuffer(&stackBuffer),
-        .stackAllocator = alloc,
+        .reader = .{ .bytecode = builder.arr.items },
         .datastoreAllocator = alloc,
         .store = .{
             .frames = &.{},
@@ -1769,13 +2207,9 @@ test "renameKeyrefs keeps keyrefs that are not renamed" {
     var cache: ValueCache = .init();
     defer cache.deinit(alloc);
 
-    var stackBuffer: [8]f32 = undefined;
-
     var interp: BytecodeInterpreter = .{
         .keyrefNames = &oldNames,
-        .reader = .{ .bytecode = builder.arr.items, .pos = 0 },
-        .valueStack = .initBuffer(&stackBuffer),
-        .stackAllocator = alloc,
+        .reader = .{ .bytecode = builder.arr.items },
         .datastoreAllocator = alloc,
         .store = .{
             .frames = &.{},
@@ -1814,13 +2248,9 @@ test "renameKeyrefs skips an identity rename" {
     var cache: ValueCache = .init();
     defer cache.deinit(alloc);
 
-    var stackBuffer: [8]f32 = undefined;
-
     var interp: BytecodeInterpreter = .{
         .keyrefNames = &names,
-        .reader = .{ .bytecode = builder.arr.items, .pos = 0 },
-        .valueStack = .initBuffer(&stackBuffer),
-        .stackAllocator = alloc,
+        .reader = .{ .bytecode = builder.arr.items },
         .datastoreAllocator = alloc,
         .store = .{
             .frames = &.{},

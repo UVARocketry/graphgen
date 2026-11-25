@@ -220,8 +220,32 @@ pub fn run(
 
     var frameData: [32]f32 = undefined;
 
-    const stack: []f32 = try gpa.alloc(f32, 128);
+    var maxStack: u32 = 1;
+    for (graphs.graph) |graph| {
+        if (graph.filter.left) |left| {
+            maxStack = @max(maxStack, try bytecode.getMaxStackUsage(left.value));
+        }
+        if (graph.filter.right) |right| {
+            maxStack = @max(maxStack, try bytecode.getMaxStackUsage(right.value));
+        }
+        maxStack = @max(maxStack, try bytecode.getMaxStackUsage(graph.x.value));
+        for (graph.y) |axis| {
+            maxStack = @max(maxStack, try bytecode.getMaxStackUsage(axis.value));
+        }
+        for (graph.annotation) |annotation| {
+            maxStack = @max(maxStack, try bytecode.getMaxStackUsage(annotation.line));
+            maxStack = @max(maxStack, try bytecode.getMaxStackUsage(annotation.x));
+            maxStack = @max(maxStack, try bytecode.getMaxStackUsage(annotation.y));
+            for (annotation.value) |value| {
+                maxStack = @max(maxStack, try bytecode.getMaxStackUsage(value));
+            }
+        }
+    }
+
+    const stack: []f32 = try gpa.alloc(f32, maxStack);
     defer gpa.free(stack);
+    const batchStack: []f32 = try gpa.alloc(f32, @as(usize, maxStack) * bc.batch_len);
+    defer gpa.free(batchStack);
 
     for (graphs.graph) |*graph| {
         if (graph.y.len > frameData.len - 1) {
@@ -280,6 +304,11 @@ pub fn run(
         defer if (builtin.optimize != .fast) gpa.free(stats);
         @memset(stats, .{});
 
+        const series = try gpa.alloc(f32, (graph.y.len + 1) * bc.batch_len);
+        defer gpa.free(series);
+        const annSeries = try gpa.alloc(f32, graph.annotation.len * bc.batch_len);
+        defer gpa.free(annSeries);
+
         const execStart = std.Io.Clock.awake.now(io);
         var frameCount: u32 = 0;
 
@@ -287,65 +316,101 @@ pub fn run(
         var minX: f32 = std.math.inf(f32);
         var maxY: f32 = -std.math.inf(f32);
         var minY: f32 = std.math.inf(f32);
-        frames: for (frameStart..frameEnd) |frame| {
-            if (frame % (graph.skip + 1) != 0) continue;
-            const frameNo: u32 = @intCast(frame);
+        const batchU32: u32 = @intCast(bc.batch_len);
+        var chunkStart = frameStart;
+        while (chunkStart < frameEnd) : (chunkStart +|= batchU32) {
+            const chunkEnd = @min(frameEnd, chunkStart +| batchU32);
+            const chunkCount: usize = @intCast(chunkEnd - chunkStart);
 
-            const x = bytecode.execRange(graph.x.value, frameNo, stack, 0);
-            if (std.math.isNan(x)) continue;
-            frameData[0] = x;
-
-            var tempmaxY: f32 = -std.math.inf(f32);
-            var tempminY: f32 = std.math.inf(f32);
+            bytecode.execRangeBatch(
+                graph.x.value,
+                chunkStart,
+                series[0..bc.batch_len],
+                batchStack,
+                0,
+            );
             for (graph.y, 1..) |axis, i| {
-                const y = bytecode.execRange(axis.value, frameNo, stack, 0);
-                if (std.math.isNan(y)) continue :frames;
-                tempmaxY = @max(tempmaxY, y);
-                tempminY = @min(tempminY, y);
-                frameData[i] = y;
+                const off = i * bc.batch_len;
+                bytecode.execRangeBatch(
+                    axis.value,
+                    chunkStart,
+                    series[off..][0..bc.batch_len],
+                    batchStack,
+                    0,
+                );
+            }
+            for (graph.annotation, 0..) |annotation, i| {
+                const off = i * bc.batch_len;
+                bytecode.execRangeBatch(
+                    annotation.line,
+                    chunkStart,
+                    annSeries[off..][0..bc.batch_len],
+                    batchStack,
+                    0,
+                );
             }
 
-            maxX = @max(x, maxX);
-            minX = @min(x, minX);
-            maxY = @max(tempmaxY, maxY);
-            minY = @min(tempminY, minY);
+            frames: for (0..chunkCount) |lane| {
+                const frame = chunkStart + @as(u32, @intCast(lane));
+                if (frame % (graph.skip + 1) != 0) continue;
+                const frameNo: u32 = frame;
 
-            frameCount += 1;
+                const x = series[lane];
+                if (std.math.isNan(x)) continue;
+                frameData[0] = x;
 
-            // track the frame each annotation selects from
-            for (graph.annotation, stats) |annotation, *stat| {
-                const line = bytecode.execRange(annotation.line, frameNo, stack, 0);
-                if (std.math.isNan(line)) continue;
-                const current: FrameStat = .{ .frame = @intCast(frameNo), .value = line };
-                if (!stat.hasLineData) {
-                    stat.first = current;
-                    stat.max = current;
-                    stat.min = current;
+                var tempmaxY: f32 = -std.math.inf(f32);
+                var tempminY: f32 = std.math.inf(f32);
+                for (graph.y, 1..) |_, i| {
+                    const y = series[i * bc.batch_len + lane];
+                    if (std.math.isNan(y)) continue :frames;
+                    tempmaxY = @max(tempmaxY, y);
+                    tempminY = @min(tempminY, y);
+                    frameData[i] = y;
                 }
-                stat.last = current;
-                if (line > stat.max.value) stat.max = current;
-                if (line < stat.min.value) stat.min = current;
-                stat.hasLineData = true;
-            }
 
-            for (0..graph.y.len + 1) |i| {
+                maxX = @max(x, maxX);
+                minX = @min(x, minX);
+                maxY = @max(tempmaxY, maxY);
+                minY = @min(tempminY, minY);
+
+                frameCount += 1;
+
+                // track the frame each annotation selects from
+                for (graph.annotation, stats, 0..) |_, *stat, ai| {
+                    const line = annSeries[ai * bc.batch_len + lane];
+                    if (std.math.isNan(line)) continue;
+                    const current: FrameStat = .{ .frame = @intCast(frameNo), .value = line };
+                    if (!stat.hasLineData) {
+                        stat.first = current;
+                        stat.max = current;
+                        stat.min = current;
+                    }
+                    stat.last = current;
+                    if (line > stat.max.value) stat.max = current;
+                    if (line < stat.min.value) stat.min = current;
+                    stat.hasLineData = true;
+                }
+
+                for (0..graph.y.len + 1) |i| {
+                    switch (outputType) {
+                        .bare => {
+                            const bytes: []const u8 = @ptrCast(&frameData[i]);
+                            _ = try writer.write(bytes);
+                        },
+                        .human => {
+                            try writer.print("{}", .{frameData[i]});
+                            if (i < graph.y.len) {
+                                try writer.print(", ", .{});
+                            }
+                        },
+                        .none => {},
+                    }
+                }
                 switch (outputType) {
-                    .bare => {
-                        const bytes: []const u8 = @ptrCast(&frameData[i]);
-                        _ = try writer.write(bytes);
-                    },
-                    .human => {
-                        try writer.print("{}", .{frameData[i]});
-                        if (i < graph.y.len) {
-                            try writer.print(", ", .{});
-                        }
-                    },
-                    .none => {},
+                    .human => try writer.print("\n", .{}),
+                    .none, .bare => {},
                 }
-            }
-            switch (outputType) {
-                .human => try writer.print("\n", .{}),
-                .none, .bare => {},
             }
         }
         switch (outputType) {
