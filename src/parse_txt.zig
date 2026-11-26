@@ -1,14 +1,18 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 pub const Column = struct {
     skip: u32,
     name: []const u8,
     values: []const f32,
+    mmapRef: bool = false,
 
     pub fn deinit(self: *Column, gpa: Allocator) void {
         gpa.free(self.values);
-        gpa.free(self.name);
+        if (!self.mmapRef) {
+            gpa.free(self.name);
+        }
     }
 };
 
@@ -253,14 +257,25 @@ pub fn parseV2Txt(gpa: Allocator, data: []const u8, diagnostic: *?[]const u8) ![
         totalValues += valuesCount;
 
         if (mode == .raw) {
-            if (try reader.takeByte() != '!') {
-                diagnostic.* = "Expected !";
+            const next = try reader.takeByte();
+            const isAligned = next == '#';
+            if (next != '!' and next != '#') {
+                diagnostic.* = "Expected ! or #";
                 return error.UnknownCharacter;
             }
             const valuesSlice = try reader.take(valuesCount * @sizeOf(f32));
-            const slice = try gpa.alloc(f32, valuesCount);
-            @memcpy(slice, @as([]align(1) f32, @ptrCast(valuesSlice)));
-            ret.items[i].values = slice;
+            if (!isAligned) {
+                const slice = try gpa.alloc(f32, valuesCount);
+                @memcpy(slice, @as([]align(1) f32, @ptrCast(valuesSlice)));
+                ret.items[i].values = slice;
+            } else {
+                while (reader.seek % 4 != 0) {
+                    const byte = try reader.takeByte();
+                    std.debug.assert(byte == 0);
+                }
+                ret.items[i].values = @ptrCast(@alignCast(valuesSlice));
+                ret.items[i].mmapRef = true;
+            }
             _ = try reader.takeByte();
         } else {
             const slice = try gpa.alloc(f32, valuesCount);
@@ -522,31 +537,45 @@ pub fn writeV2Txt(gpa: Allocator, columns: []const Column, mode: V2OutMode) ![]u
 }
 
 pub fn parseDbgFile(io: std.Io, gpa: Allocator, pageAlloc: Allocator, filename: []const u8, diagnostic: *?[]const u8) ![]Column {
+    _ = pageAlloc;
+    const mapStart = std.Io.Clock.awake.now(io);
     const file = try std.Io.Dir.cwd().openFile(
         io,
         filename,
         .{ .mode = .read_only },
     );
-    defer file.close(io);
+    defer if (builtin.optimize != .fast) file.close(io);
 
     const stat = try file.stat(io);
     const size = stat.size;
 
-    const buf: []u8 = &.{};
-    var r = file.reader(io, buf);
+    var map = try file.createMemoryMap(io, .{
+        .len = size,
+        .protection = .{
+            .read = true,
+            .write = false,
+        },
+        .offset = 0,
+    });
+    defer if (builtin.optimize != .fast) map.destroy(io);
+    try map.read(io);
+    {
+        const end = std.Io.Clock.awake.now(io);
 
-    const dbgContents = try r.interface.readAlloc(pageAlloc, size);
-    defer pageAlloc.free(dbgContents);
-
+        const nanos: f64 = @floatFromInt(mapStart.durationTo(end).nanoseconds);
+        std.debug.print("data mmap took {}s\n", .{nanos / 1.0e9});
+    }
     const start = std.Io.Clock.awake.now(io);
     const v = if (std.mem.endsWith(u8, filename, ".csv"))
-        parseCsv(gpa, dbgContents, diagnostic)
+        parseCsv(gpa, map.memory, diagnostic)
     else
-        parseDbgOut(gpa, dbgContents, diagnostic);
-    const end = std.Io.Clock.awake.now(io);
+        parseDbgOut(gpa, map.memory, diagnostic);
+    {
+        const end = std.Io.Clock.awake.now(io);
 
-    const nanos: f64 = @floatFromInt(start.durationTo(end).nanoseconds);
-    std.debug.print("data fetch took {}s\n", .{nanos / 1.0e9});
+        const nanos: f64 = @floatFromInt(start.durationTo(end).nanoseconds);
+        std.debug.print("data parse took {}s\n", .{nanos / 1.0e9});
+    }
     return v;
 }
 

@@ -333,13 +333,14 @@ pub const BytecodeFilter = struct {
 };
 
 /// Number of frames evaluated together by the batched interpreter.
-pub const batch_len: usize = 128;
+pub const batch_len: usize = 32;
 const vec_len: usize = std.simd.suggestVectorLength(f32).?;
 const Vec = @Vector(vec_len, f32);
 
-inline fn slotSlice(stack: []f32, slot: u32) []f32 {
+inline fn slotSlice(stack: []f32, slot: u32) *[batch_len]f32 {
     const start = @as(usize, slot) * batch_len;
-    return stack[start..][0..batch_len];
+    const slice = stack[start..][0..batch_len];
+    return @ptrCast(slice.ptr);
 }
 
 inline fn loadVec(src: []const f32, i: usize) Vec {
@@ -350,24 +351,28 @@ inline fn storeVec(dst: []f32, i: usize, v: Vec) void {
     @as(*align(1) Vec, @ptrCast(&dst[i])).* = v;
 }
 
-fn fillFrameColumn(out: []f32, frame: *const Frame, startFrame: i64) void {
+fn fillFrameColumn(out: *[batch_len]f32, frame: *const Frame, startFrame: i64) void {
     const nan = std.math.nan(f32);
-    @memset(out, nan);
+    out.* = @splat(nan);
 
     const forcedLeft: i64 = @intCast(frame.skip);
     const forcedRight: i64 = forcedLeft + @as(i64, @intCast(frame.values.len));
     const lo = @max(startFrame, forcedLeft);
-    const hi = @min(startFrame + @as(i64, @intCast(out.len)), forcedRight);
+    const hi = @min(startFrame + @as(i64, @intCast(batch_len)), forcedRight);
     if (lo >= hi) return;
 
     const outOff: usize = @intCast(lo - startFrame);
     const srcOff: usize = @intCast(lo - forcedLeft);
     const n: usize = @intCast(hi - lo);
-    @memcpy(out[outOff..][0..n], frame.values[srcOff..][0..n]);
+    if (n == batch_len) {
+        out.* = frame.values[srcOff..][0..batch_len].*;
+    } else {
+        @memcpy(out[outOff..][0..n], frame.values[srcOff..][0..n]);
+    }
 }
 
-fn fillScalar(out: []f32, value: f32) void {
-    @memset(out, value);
+fn fillScalar(out: *[batch_len]f32, value: f32) void {
+    out.* = @splat(value);
 }
 
 fn maskNegativeFrames(out: []f32, startFrame: i64) void {
@@ -1030,8 +1035,12 @@ pub const BytecodeInterpreter = struct {
     ) void {
         self.execBatchSlot(range, @intCast(frameStart), stack, baseSlot);
         const src = slotSlice(stack, baseSlot);
-        const n = @min(out.len, batch_len);
-        @memcpy(out[0..n], src[0..n]);
+        if (out.len >= batch_len) {
+            const dst: *[batch_len]f32 = @ptrCast(out.ptr);
+            dst.* = src.*;
+        } else {
+            @memcpy(out, src[0..out.len]);
+        }
     }
 
     fn execBatchSlot(
@@ -1094,7 +1103,7 @@ pub const BytecodeInterpreter = struct {
                     .fn_arg => {
                         const argId: FnArg = self.reader.eatPushArgs(.fn_arg, &ip);
                         const srcSlot: u32 = baseSlot - @as(u32, argId.argIndex) - 1;
-                        @memcpy(slotSlice(stack, sp), slotSlice(stack, srcSlot));
+                        slotSlice(stack, sp).* = slotSlice(stack, srcSlot).*;
                         sp += 1;
                     },
                 }
@@ -1108,7 +1117,7 @@ pub const BytecodeInterpreter = struct {
 
                         const passed: u32 = args.argsPassed;
                         if (passed != 0) {
-                            @memcpy(slotSlice(stack, sp - passed), slotSlice(stack, sp));
+                            slotSlice(stack, sp - passed).* = slotSlice(stack, sp).*;
                         }
                         sp = sp - passed + 1;
                     },
@@ -1273,7 +1282,7 @@ pub const BytecodeInterpreter = struct {
                     var frame = leftBound;
                     while (frame < rightBound) : (frame += batchU32) {
                         self.execBatchSlot(ref, @intCast(frame), stack, baseSlot);
-                        for (slotSlice(stack, baseSlot)) |v| {
+                        for (slotSlice(stack, baseSlot).*) |v| {
                             if (!std.math.isNan(v)) break :blk v;
                         }
                     }
@@ -1300,7 +1309,7 @@ pub const BytecodeInterpreter = struct {
                     var frame = leftBound;
                     while (frame < rightBound) : (frame += batchU32) {
                         self.execBatchSlot(ref, @intCast(frame), stack, baseSlot);
-                        for (slotSlice(stack, baseSlot)) |v| {
+                        for (slotSlice(stack, baseSlot).*) |v| {
                             if (std.math.isNan(v)) continue;
                             if (std.math.isNan(val)) {
                                 val = v;
@@ -1319,7 +1328,7 @@ pub const BytecodeInterpreter = struct {
                     var frame = leftBound;
                     while (frame < rightBound) : (frame += batchU32) {
                         self.execBatchSlot(ref, @intCast(frame), stack, baseSlot);
-                        for (slotSlice(stack, baseSlot)) |v| {
+                        for (slotSlice(stack, baseSlot).*) |v| {
                             if (std.math.isNan(v)) continue;
                             sum += v;
                             count += 1;
