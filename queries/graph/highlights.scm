@@ -28,9 +28,9 @@
 ; References
 (value_ref
   "#" @punctuation.special
-  name: (identifier) @property)
+  name: (identifier) @variable)
 
-(naked_value_ref) @property
+(naked_value_ref) @variable
 
 (keyref) @variable
 
