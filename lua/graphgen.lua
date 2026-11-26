@@ -11,7 +11,8 @@ function M.setup()
 			require("nvim-treesitter.parsers").graph = {
 				install_info = {
 					url = "https://github.com/UVARocketry/graphgen",
-					files = { "tree-sitter-graph/src/parser.c" },
+					files = { "src/parser.c" },
+					location = "tree-sitter-graph",
 					generate = false,
 				},
 			}
