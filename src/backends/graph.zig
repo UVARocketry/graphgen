@@ -247,6 +247,7 @@ pub fn run(
     const batchStack: []f32 = try gpa.alloc(f32, @as(usize, maxStack) * bc.batch_len);
     defer gpa.free(batchStack);
 
+    const graphsStart = std.Io.Clock.awake.now(io);
     for (graphs.graph) |*graph| {
         if (graph.y.len > frameData.len - 1) {
             return error.TooManyYValues;
@@ -417,12 +418,12 @@ pub fn run(
             .bare => try writer.print("\x7F\x80\xAB\xCD", .{}),
             .none, .human => {},
         }
-        std.debug.print("  generated data for {} frames\n", .{frameCount});
         {
             const end = std.Io.Clock.awake.now(io);
             const nanos: f32 = @floatFromInt(execStart.durationTo(end).nanoseconds);
             std.debug.print("  frame exec took {}s\n", .{nanos / 1.0e9});
         }
+        std.debug.print("  generated data for {} frames\n", .{frameCount});
 
         switch (outputType) {
             .bare, .human => {
@@ -507,5 +508,10 @@ pub fn run(
             .bare, .human => try writer.print("END\n", .{}),
             .none => {},
         }
+    }
+    {
+        const end = std.Io.Clock.awake.now(io);
+        const nanos: f32 = @floatFromInt(graphsStart.durationTo(end).nanoseconds);
+        std.debug.print("graph data gen took {}s\n", .{nanos / 1.0e9});
     }
 }
