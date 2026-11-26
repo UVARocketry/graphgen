@@ -1,6 +1,6 @@
 local M = {}
 
-function M.init()
+function M.setup()
 	vim.api.nvim_create_autocmd("User", {
 		pattern = "TSUpdate",
 		callback = function()
