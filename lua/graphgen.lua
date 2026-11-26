@@ -1,6 +1,10 @@
 local M = {}
 
 function M.setup()
+	vim.filetype.add({
+		extension = { graph = "graph" },
+	})
+
 	vim.api.nvim_create_autocmd("User", {
 		pattern = "TSUpdate",
 		callback = function()
