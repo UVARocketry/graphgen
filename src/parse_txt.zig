@@ -263,16 +263,18 @@ pub fn parseV2Txt(gpa: Allocator, data: []const u8, diagnostic: *?[]const u8) ![
                 diagnostic.* = "Expected ! or #";
                 return error.UnknownCharacter;
             }
+            if (isAligned) {
+                while (reader.seek % 4 != 0) {
+                    const byte = try reader.takeByte();
+                    std.debug.assert(byte == 0);
+                }
+            }
             const valuesSlice = try reader.take(valuesCount * @sizeOf(f32));
             if (!isAligned) {
                 const slice = try gpa.alloc(f32, valuesCount);
                 @memcpy(slice, @as([]align(1) f32, @ptrCast(valuesSlice)));
                 ret.items[i].values = slice;
             } else {
-                while (reader.seek % 4 != 0) {
-                    const byte = try reader.takeByte();
-                    std.debug.assert(byte == 0);
-                }
                 ret.items[i].values = @ptrCast(@alignCast(valuesSlice));
                 ret.items[i].mmapRef = true;
             }
