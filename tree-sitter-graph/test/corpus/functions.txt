@@ -1,0 +1,103 @@
+================================================================================
+Function with no parameters
+================================================================================
+
+fn input() = 1.0
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_definition
+    (identifier)
+    (parameter_list)
+    (number)))
+
+================================================================================
+Function with parameters
+================================================================================
+
+fn ft_to_m(input) = input() * 3.28
+fn m_to_ft(input) = input() / 3.28
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_definition
+    (identifier)
+    (parameter_list
+      (parameter
+        (identifier)))
+    (binary_expression
+      (call
+        (identifier)
+        (arguments))
+      (number)))
+  (function_definition
+    (identifier)
+    (parameter_list
+      (parameter
+        (identifier)))
+    (binary_expression
+      (call
+        (identifier)
+        (arguments))
+      (number))))
+
+================================================================================
+Function with multiple parameters
+================================================================================
+
+fn lerp(a, b, t) = a * t + b * t
+
+--------------------------------------------------------------------------------
+
+
+
+================================================================================
+Function body can be any expression
+================================================================================
+
+fn constant() = .kalmanPosZ_m_agl:last
+fn scale() = 2.0 * 3.28
+fn offset() = m_to_ft(.kalmanPosZ_m_agl) - 100.0
+fn compare() = .timestamp_s > 3800
+fn negated() = -1.5
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_definition
+    (identifier)
+    (parameter_list)
+    (keyref
+      (keyref_path)
+      (access_type
+        (identifier))))
+  (function_definition
+    (identifier)
+    (parameter_list)
+    (binary_expression
+      (number)
+      (number)))
+  (function_definition
+    (identifier)
+    (parameter_list)
+    (binary_expression
+      (call
+        (identifier)
+        (arguments
+          (keyref
+            (keyref_path))))
+      (number)))
+  (function_definition
+    (identifier)
+    (parameter_list)
+    (binary_expression
+      (keyref
+        (keyref_path))
+      (number)))
+  (function_definition
+    (identifier)
+    (parameter_list)
+    (unary_expression
+      (number))))

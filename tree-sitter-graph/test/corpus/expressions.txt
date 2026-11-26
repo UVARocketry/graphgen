@@ -1,0 +1,312 @@
+================================================================================
+Number expression
+================================================================================
+
+scale = 3.28
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (expression
+      (number))))
+
+================================================================================
+Keyref paths
+================================================================================
+
+a = .timestamp_s
+b = .worldSpace.acc_mps2
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (expression
+      (keyref
+        (keyref_path))))
+  (pair
+    (identifier)
+    (expression
+      (keyref
+        (keyref_path)))))
+
+================================================================================
+Keyrefs with access types
+================================================================================
+
+a = .kalmanPosZ_m_agl:last
+b = .worldSpace.acc_mps2:mean
+c = .kalmanPosZ_m_agl:min
+d = .kalmanPosZ_m_agl:max
+e = .kalmanPosZ_m_agl:first
+f = .kalmanPosZ_m_agl:last
+g = .kalmanPosZ_m_agl:prev
+h = .kalmanPosZ_m_agl:current
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (expression
+      (keyref
+        (keyref_path)
+        (access_type
+          (identifier)))))
+  (pair
+    (identifier)
+    (expression
+      (keyref
+        (keyref_path)
+        (access_type
+          (identifier)))))
+  (pair
+    (identifier)
+    (expression
+      (keyref
+        (keyref_path)
+        (access_type
+          (identifier)))))
+  (pair
+    (identifier)
+    (expression
+      (keyref
+        (keyref_path)
+        (access_type
+          (identifier)))))
+  (pair
+    (identifier)
+    (expression
+      (keyref
+        (keyref_path)
+        (access_type
+          (identifier)))))
+  (pair
+    (identifier)
+    (expression
+      (keyref
+        (keyref_path)
+        (access_type
+          (identifier)))))
+  (pair
+    (identifier)
+    (expression
+      (keyref
+        (keyref_path)
+        (access_type
+          (identifier)))))
+  (pair
+    (identifier)
+    (expression
+      (keyref
+        (keyref_path)
+        (access_type
+          (identifier))))))
+
+================================================================================
+Value references in expressions
+================================================================================
+
+a = #x
+b = #kalmanpos
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (expression
+      (value_ref
+        (identifier))))
+  (pair
+    (identifier)
+    (expression
+      (value_ref
+        (identifier)))))
+
+================================================================================
+Function calls
+================================================================================
+
+a = m_to_ft(.kalmanPosZ_m_agl)
+b = m_to_ft(.lowerBound_m_agl)
+c = pow(2.0, 3.0)
+d = noargs()
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (expression
+      (call
+        (identifier)
+        (arguments
+          (keyref
+            (keyref_path))))))
+  (pair
+    (identifier)
+    (expression
+      (call
+        (identifier)
+        (arguments
+          (keyref
+            (keyref_path))))))
+  (pair
+    (identifier)
+    (expression
+      (call
+        (identifier)
+        (arguments
+          (number)
+          (number)))))
+  (pair
+    (identifier)
+    (expression
+      (call
+        (identifier)
+        (arguments)))))
+
+================================================================================
+Arithmetic precedence
+================================================================================
+
+a = 1 + 2 * 3
+b = 1 * 2 + 3
+c = 10 - 2 - 3
+d = 8 / 4 / 2
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (expression
+      (binary_expression
+        (number)
+        (binary_expression
+          (number)
+          (number)))))
+  (pair
+    (identifier)
+    (expression
+      (binary_expression
+        (binary_expression
+          (number)
+          (number))
+        (number))))
+  (pair
+    (identifier)
+    (expression
+      (binary_expression
+        (binary_expression
+          (number)
+          (number))
+        (number))))
+  (pair
+    (identifier)
+    (expression
+      (binary_expression
+        (binary_expression
+          (number)
+          (number))
+        (number)))))
+
+================================================================================
+Comparisons
+================================================================================
+
+a = .timestamp_s > 3800
+b = .worldSpace.acc_mps2 >= -80
+c = .timestamp_s < 1
+d = .timestamp_s <= 1
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (expression
+      (binary_expression
+        (keyref
+          (keyref_path))
+        (number))))
+  (pair
+    (identifier)
+    (expression
+      (binary_expression
+        (keyref
+          (keyref_path))
+        (unary_expression
+          (number)))))
+  (pair
+    (identifier)
+    (expression
+      (binary_expression
+        (keyref
+          (keyref_path))
+        (number))))
+  (pair
+    (identifier)
+    (expression
+      (binary_expression
+        (keyref
+          (keyref_path))
+        (number)))))
+
+================================================================================
+Unary negation
+================================================================================
+
+a = -.5
+b = -1 * 2
+c = 1 - -2
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (expression
+      (unary_expression
+        (keyref
+          (keyref_path)))))
+  (pair
+    (identifier)
+    (expression
+      (binary_expression
+        (unary_expression
+          (number))
+        (number))))
+  (pair
+    (identifier)
+    (expression
+      (binary_expression
+        (number)
+        (unary_expression
+          (number))))))
+
+================================================================================
+Chained call, keyref with access type and comparison
+================================================================================
+
+value = m_to_ft(.kalmanPosZ_m_agl:last) > 100.0
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (expression
+      (binary_expression
+        (call
+          (identifier)
+          (arguments
+            (keyref
+              (keyref_path)
+              (access_type
+                (identifier)))))
+        (number)))))

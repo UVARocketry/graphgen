@@ -1,0 +1,93 @@
+================================================================================
+Whole line comment
+================================================================================
+
+; the actual format of the file is up for debate
+use "./debug_out.txt"
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (comment)
+  (pair
+    (identifier)
+    (string)))
+
+================================================================================
+Trailing comment
+================================================================================
+
+saveto "../plots/out.png" ; where the plot ends up
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (string))
+  (comment))
+
+================================================================================
+Comment inside an object
+================================================================================
+
+graph {
+    ; the '=' denotes an expression context
+    value = .timestamp_s > 3800
+    hint monotonic
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (object
+      (comment)
+      (pair
+        (identifier)
+        (expression
+          (binary_expression
+            (keyref
+              (keyref_path))
+            (number))))
+      (pair
+        (identifier)
+        (identifier)))))
+
+================================================================================
+Comment only file
+================================================================================
+
+; just a comment
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (comment))
+
+================================================================================
+Blank line between statements
+================================================================================
+
+fn input() = 1.0
+
+fn ft_to_m(input) = input() * 3.28
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_definition
+    (identifier)
+    (parameter_list)
+    (number))
+  (function_definition
+    (identifier)
+    (parameter_list
+      (parameter
+        (identifier)))
+    (binary_expression
+      (call
+        (identifier)
+        (arguments))
+      (number))))

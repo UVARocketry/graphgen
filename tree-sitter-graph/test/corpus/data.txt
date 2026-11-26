@@ -1,0 +1,251 @@
+================================================================================
+Empty file
+================================================================================
+
+--------------------------------------------------------------------------------
+
+(source_file)
+
+================================================================================
+Top level key/value pairs
+================================================================================
+
+use "./debug_out.txt"
+saveto "../plots/out.png"
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (string))
+  (pair
+    (identifier)
+    (string)))
+
+================================================================================
+String values
+================================================================================
+
+title "timestamp (s)"
+subtitle 'single quoted'
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (string))
+  (pair
+    (identifier)
+    (string)))
+
+================================================================================
+Number values
+================================================================================
+
+int 1
+float 3.28
+trailing_dot 1.
+negative -0.8
+negative_int -80
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (number))
+  (pair
+    (identifier)
+    (number))
+  (pair
+    (identifier)
+    (number))
+  (pair
+    (identifier)
+    (negative_number))
+  (pair
+    (identifier)
+    (negative_number)))
+
+================================================================================
+Bare identifier values
+================================================================================
+
+hint monotonic
+hint spike
+select max
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (identifier))
+  (pair
+    (identifier)
+    (identifier))
+  (pair
+    (identifier)
+    (identifier)))
+
+================================================================================
+Nested objects
+================================================================================
+
+graph {
+    x {
+        value = .timestamp_s
+        title "timestamp (s)"
+    }
+    y {
+        value = .kalmanPosZ_m_agl
+        title "kalman pos z"
+    }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (object
+      (pair
+        (identifier)
+        (object
+          (pair
+            (identifier)
+            (expression
+              (keyref
+                (keyref_path))))
+          (pair
+            (identifier)
+            (string))))
+      (pair
+        (identifier)
+        (object
+          (pair
+            (identifier)
+            (expression
+              (keyref
+                (keyref_path))))
+          (pair
+            (identifier)
+            (string)))))))
+
+================================================================================
+Object with a trailing comma
+================================================================================
+
+arrow {
+    dx -5
+    dy -2000,
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (object
+      (pair
+        (identifier)
+        (negative_number))
+      (pair
+        (identifier)
+        (negative_number)))))
+
+================================================================================
+Empty object
+================================================================================
+
+filter {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (object)))
+
+================================================================================
+Value reference declarations and uses
+================================================================================
+
+x {
+    value #x = .timestamp_s
+}
+annotation {
+    line !#kalmanpos
+    x = #x
+    y = #kalmanpos
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (object
+      (pair
+        (identifier)
+        (value_ref
+          (identifier))
+        (expression
+          (keyref
+            (keyref_path))))))
+  (pair
+    (identifier)
+    (object
+      (pair
+        (identifier)
+        (naked_value_ref
+          (value_ref
+            (identifier))))
+      (pair
+        (identifier)
+        (expression
+          (value_ref
+            (identifier))))
+      (pair
+        (identifier)
+        (expression
+          (value_ref
+            (identifier)))))))
+
+================================================================================
+Keywords are ordinary object keys
+================================================================================
+
+graph {
+    saveto "../plots/kalmanPos.png"
+    filter {
+        left {
+            value = .timestamp_s > 3800
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (pair
+    (identifier)
+    (object
+      (pair
+        (identifier)
+        (string))
+      (pair
+        (identifier)
+        (object
+          (pair
+            (identifier)
+            (object
+              (pair
+                (identifier)
+                (expression
+                  (binary_expression
+                    (keyref
+                      (keyref_path))
+                    (number)))))))))))
