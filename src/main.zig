@@ -492,7 +492,7 @@ pub fn printHelpFor(T: type, stdout: *Io.Writer, name: []const u8, default: ?*co
 
     try printFields(T, stdout);
 
-    if (@typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .slice) {
+    if (@typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .slice and @typeInfo(T).pointer.child != u8) {
         try writeColor(stdout, ansi.yellow, "\nNOTE: ");
         try stdout.print("'{s}' is an array field so it can be repeated multiple times\n", .{name});
     }
