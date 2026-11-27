@@ -27,8 +27,7 @@
 
 (pair
   key: (identifier)
-  (_value
-  enum_value: (identifier) @constant.enum))
+  (identifier) @constant.enum)
 
 ; References
 (value_ref
