@@ -1,2 +1,7 @@
 .zig-cache/
 zig-out/
+*.txt
+zig-pkg/
+
+__pycache__/
+plots/
