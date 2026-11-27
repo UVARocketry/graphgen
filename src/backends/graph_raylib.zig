@@ -459,6 +459,13 @@ fn readGraph(reader: *std.Io.Reader, gpa: Allocator) !void {
         .green,
         .blue,
         .red,
+        .orange,
+        .purple,
+        .brown,
+        .yellow,
+        .purple,
+        .pink,
+        .magenta,
     };
 
     for (0..floatArray.items.len / (yCount + 1)) |row| {
