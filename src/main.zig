@@ -291,6 +291,305 @@ pub fn doTransformCsv(
     std.debug.print("transform took {}s\n", .{nanos / 1.0e9});
 }
 
+const ansi = struct {
+    const reset = "\x1b[0m";
+    const blue = "\x1b[34m";
+    const cyan = "\x1b[36m";
+    const green = "\x1b[32m";
+    const yellow = "\x1b[33m";
+    const red = "\x1b[31m";
+    const gray = "\x1b[90m";
+    const purple = "\x1b[35m";
+    const bold = "\x1b[1m";
+};
+
+fn writeColor(out: *std.Io.Writer, color: []const u8, text: []const u8) !void {
+    try out.writeAll(color);
+    try out.writeAll(text);
+    try out.writeAll(ansi.reset);
+}
+
+pub fn typeNameFor(T: type, out: *std.Io.Writer) !void {
+    switch (@typeInfo(T)) {
+        .pointer => |p| {
+            if (p.child == u8 and p.attrs.@"const") {
+                try writeColor(out, ansi.green, "string");
+            } else {
+                try writeColor(out, ansi.yellow, "array of ");
+                try typeNameFor(p.child, out);
+            }
+        },
+        .optional => |o| {
+            try writeColor(out, ansi.yellow, "null or ");
+            try typeNameFor(o.child, out);
+        },
+        .@"struct" => {
+            if (T == debuggraph_zig.types.Bytecode) {
+                try writeColor(out, ansi.purple, "bytecode");
+                return;
+            }
+            try out.writeAll(ansi.green);
+            try out.print("object{{{s}}}", .{@typeName(T)});
+            try out.writeAll(ansi.reset);
+        },
+        .int => |i| {
+            if (i.signedness == .signed) {
+                try writeColor(out, ansi.yellow, "signed ");
+            } else {
+                try writeColor(out, ansi.yellow, "unsigned ");
+            }
+            try out.writeAll(ansi.green);
+            try out.print("{} bit integer", .{i.bits});
+            try out.writeAll(ansi.reset);
+        },
+        .float => |i| {
+            try out.writeAll(ansi.green);
+            try out.print("{} bit float", .{i.bits});
+            try out.writeAll(ansi.reset);
+        },
+        .@"enum" => |e| {
+            try writeColor(out, ansi.yellow, "enum of ");
+            for (e.field_names, 0..) |n, i| {
+                try writeColor(out, ansi.green, n);
+                if (i < e.field_names.len - 1) {
+                    try out.writeAll(", ");
+                }
+                if (i == e.field_names.len - 2) {
+                    try out.writeAll("or ");
+                }
+            }
+        },
+        else => unreachable,
+    }
+}
+
+pub fn printDefault(T: type, value: *const T, out: *std.Io.Writer, indent: u32) !void {
+    switch (@typeInfo(T)) {
+        .pointer => |p| {
+            if (p.child == u8 and p.attrs.@"const") {
+                try out.writeAll(ansi.green);
+                try out.print("\"{s}\"", .{value.*});
+                try out.writeAll(ansi.reset);
+                return;
+            }
+
+            try writeColor(out, ansi.cyan, "[\n");
+            for (value.*) |v| {
+                for (0..indent + 2) |_| try out.writeAll(" ");
+                try printDefault(p.child, &v, out, indent + 2);
+                try out.writeAll("\n");
+            }
+            for (0..indent) |_| try out.writeAll(" ");
+            try writeColor(out, ansi.cyan, "]");
+        },
+        .@"enum" => {
+            try out.writeAll(ansi.green);
+            try out.print("{t}", .{value.*});
+            try out.writeAll(ansi.reset);
+        },
+        .optional => |o| {
+            if (value.*) |sub| {
+                try printDefault(o.child, &sub, out, indent);
+            } else {
+                try writeColor(out, ansi.gray, "null");
+            }
+        },
+        .int => {
+            try out.writeAll(ansi.green);
+            try out.print("{}", .{value.*});
+            try out.writeAll(ansi.reset);
+        },
+        .float => {
+            try out.writeAll(ansi.green);
+            try out.print("{}", .{value.*});
+            try out.writeAll(ansi.reset);
+        },
+        .@"struct" => |s| {
+            try writeColor(out, ansi.cyan, "{\n");
+            inline for (s.field_names, s.field_types) |n, F| {
+                for (0..indent + 2) |_| try out.writeAll(" ");
+                try writeColor(out, ansi.blue, n);
+                try out.writeAll(" ");
+                try printDefault(F, &@field(value.*, n), out, indent + 2);
+                try out.writeAll("\n");
+            }
+            for (0..indent) |_| try out.writeAll(" ");
+            try writeColor(out, ansi.cyan, "}");
+        },
+        else => unreachable,
+    }
+}
+
+pub fn printFields(T: type, out: *std.Io.Writer) !void {
+    switch (@typeInfo(T)) {
+        .pointer => |p| {
+            try printFields(p.child, out);
+            return;
+        },
+        .optional => |o| {
+            try printFields(o.child, out);
+            return;
+        },
+        .@"struct" => {
+            if (T == debuggraph_zig.types.Bytecode) return;
+        },
+        else => return,
+    }
+
+    const info = @typeInfo(T).@"struct";
+
+    var defaults: u32 = 0;
+    var requireds: u32 = 0;
+    inline for (info.field_attrs) |a| {
+        if (a.default_value_ptr != null) {
+            defaults += 1;
+            continue;
+        }
+        requireds += 1;
+    }
+
+    try out.writeAll("\n");
+    try writeColor(out, ansi.bold ++ ansi.blue, "Required fields:");
+    try out.writeAll("\n");
+
+    if (requireds == 0) {
+        try writeColor(out, ansi.gray, "  NONE\n");
+    }
+
+    inline for (info.field_names, info.field_types, info.field_attrs) |n, F, a| {
+        if (a.default_value_ptr != null) {
+            continue;
+        }
+        try writeColor(out, ansi.blue, "  ");
+        try writeColor(out, ansi.blue, n);
+        try writeColor(out, ansi.gray, ": ");
+        try typeNameFor(F, out);
+        try out.writeAll("\n");
+    }
+
+    if (defaults != 0) {
+        try out.writeAll("\n");
+        try writeColor(out, ansi.bold ++ ansi.yellow, "Optional fields (have default values):");
+        try out.writeAll("\n");
+    }
+
+    inline for (info.field_names, info.field_types, info.field_attrs) |n, F, a| {
+        if (a.default_value_ptr == null) {
+            continue;
+        }
+        try writeColor(out, ansi.yellow, "  ");
+        try writeColor(out, ansi.yellow, n);
+        try writeColor(out, ansi.gray, ": ");
+        try typeNameFor(F, out);
+        try out.writeAll("\n");
+    }
+}
+
+pub fn printHelpFor(T: type, stdout: *Io.Writer, name: []const u8, default: ?*const anyopaque) !void {
+    try writeColor(stdout, ansi.bold ++ ansi.blue, "Type: ");
+    try typeNameFor(T, stdout);
+    try stdout.writeAll("\n");
+
+    try printFields(T, stdout);
+
+    if (@typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .slice) {
+        try writeColor(stdout, ansi.yellow, "\nNOTE: ");
+        try stdout.print("'{s}' is an array field so it can be repeated multiple times\n", .{name});
+    }
+
+    if (default) |_defaultPtr| {
+        const defaultPtr: *const T = @ptrCast(@alignCast(_defaultPtr));
+
+        try outWriteDefaultLabel(stdout);
+        try printDefault(T, defaultPtr, stdout, 0);
+        try stdout.writeAll("\n");
+    }
+}
+
+fn outWriteDefaultLabel(stdout: *Io.Writer) !void {
+    try writeColor(stdout, ansi.bold ++ ansi.yellow, "\nDefault: ");
+}
+
+const CompressedField = struct {
+    T: type,
+    fullname: []const u8,
+    default: ?*const anyopaque,
+};
+
+pub fn fieldsCompressed(comptime T: type, comptime base: []const u8) []const CompressedField {
+    var ret1: []const CompressedField = &.{};
+
+    const info1 = @typeInfo(T);
+    if (info1 == .pointer) {
+        if (info1.pointer.size == .slice) {
+            return fieldsCompressed(info1.pointer.child, base);
+        }
+    }
+    if (info1 == .optional) {
+        return fieldsCompressed(info1.optional.child, base);
+    }
+    if (T == debuggraph_zig.types.Bytecode) {
+        return &.{};
+    }
+    if (info1 != .@"struct") {
+        return &.{};
+    }
+
+    const info = info1.@"struct";
+
+    comptime for (info.field_names, info.field_types, info.field_attrs) |name, F, attr| {
+        const newBase = base ++ name ++ ".";
+        const extra: CompressedField = .{
+            .T = F,
+            .fullname = base ++ name,
+            .default = attr.default_value_ptr,
+        };
+        ret1 = ret1 ++ .{
+            extra,
+        };
+        const rest = fieldsCompressed(F, newBase);
+        ret1 = ret1 ++ rest;
+    };
+
+    const ret: []const CompressedField = ret1;
+    return ret;
+}
+
+pub fn doKeyHelp(
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    args: []const []const u8,
+) !void {
+    if (args.len < 3) {
+        try writeColor(stderr, ansi.bold ++ ansi.red, "Error from 'help' subcommand: ");
+        try stderr.writeAll("no accessor provided\n");
+        return;
+    }
+
+    const key = args[2];
+    if (std.mem.eql(u8, key, ".")) {
+        try writeColor(stdout, ansi.bold ++ ansi.blue, "Help for '.':\n");
+        try printHelpFor(graph.Graphs, stdout, key, null);
+        return;
+    }
+
+    const allFields = comptime fieldsCompressed(graph.Graphs, ".");
+
+    inline for (allFields) |i| {
+        if (std.mem.eql(u8, key, i.fullname)) {
+            try writeColor(stdout, ansi.bold ++ ansi.blue, "Help for '");
+            try writeColor(stdout, ansi.yellow, i.fullname);
+            try writeColor(stdout, ansi.bold ++ ansi.blue, "':\n");
+            try printHelpFor(i.T, stdout, i.fullname, i.default);
+
+            break;
+        }
+    } else {
+        try writeColor(stderr, ansi.bold ++ ansi.red, "Could not find key reference: ");
+        try writeColor(stderr, ansi.yellow, key);
+        try stderr.writeAll("\n");
+    }
+}
 const GraphArgs = struct {
     file: []const u8,
     outputType: graph.OutType,
@@ -1003,7 +1302,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.len == 1) {
         _ = try stdout.write(
-            "need a subcommand: can have 'plot', 'graph', 'ingest_csv', 'transformcsv'\n",
+            "need a subcommand: can have 'plot', 'graph', 'ingest_csv', 'transformcsv', 'keyhelp'\n",
         );
         return;
     }
@@ -1012,33 +1311,29 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, subcommand, "plot")) {
         try doPlot(io, init.gpa, std.heap.page_allocator, stdout, stderr, args);
-        try stdout.flush();
     } else if (std.mem.eql(u8, subcommand, "parse")) {
         try doParse(io, init.gpa, std.heap.page_allocator, stdout, stderr, args);
-        try stdout.flush();
+    } else if (std.mem.eql(u8, subcommand, "keyhelp")) {
+        try doKeyHelp(stdout, stderr, args);
     } else if (std.mem.eql(u8, subcommand, "graph")) {
         try doGraph(io, init.gpa, std.heap.page_allocator, stdout, stderr, args);
-        try stdout.flush();
     } else if (std.mem.eql(u8, subcommand, "graph-rl")) {
         try doRlgraph(io, init.gpa, std.heap.page_allocator, stdout, stderr, args);
-        try stdout.flush();
     } else if (std.mem.eql(u8, subcommand, "ingest_csv")) {
         try doIngestCsv(io, init.gpa, std.heap.page_allocator, stdout, stderr, args);
-        try stdout.flush();
     } else if (std.mem.eql(u8, subcommand, "transformcsv")) {
         try doTransformCsv(io, init.gpa, std.heap.page_allocator, stdout, stderr, args);
-        try stdout.flush();
     } else if (std.mem.eql(u8, subcommand, "list_keys")) {
         try listKeys(io, init.gpa, std.heap.page_allocator, stdout, args);
-        try stdout.flush();
     } else if (std.mem.eql(u8, subcommand, "resultsof")) {
         try resultsOf(io, init.gpa, std.heap.page_allocator, stdout, args);
     } else if (std.mem.eql(u8, subcommand, "cool")) {
         try cool(io, init.gpa, std.heap.page_allocator, stdout, stderr);
-        try stdout.flush();
     } else {
-        try stdout.print("unknown subcommand, got '{s}'\n", .{subcommand});
-        try stdout.flush();
+        try stderr.print("unknown subcommand, got '{s}'\n", .{subcommand});
+        try stderr.flush();
         return error.UnknownSubcommand;
     }
+    try stdout.flush();
+    try stderr.flush();
 }

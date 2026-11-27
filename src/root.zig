@@ -13,7 +13,7 @@ pub const graph = @import("backends/graph.zig");
 const options = @import("options");
 pub const graph_rl = if (options.raylib) @import("backends/graph_raylib.zig") else void;
 pub const transformcsv = @import("backends/transformcsv.zig");
-// const Res = @import("parse/types.zig").Graphs;
+pub const types = @import("parse/types.zig");
 pub const parse = @import("parse/parse.zig");
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
@@ -39,7 +39,6 @@ test "basic add functionality" {
 
 test "typed parse" {
     const gpa = std.testing.allocator;
-    const types = @import("parse/types.zig");
     const T = struct {
         name: []const u8,
         count: f32,
@@ -225,7 +224,6 @@ test "extra fields empty" {
 
 test "extra fields bytecode" {
     const gpa = std.testing.allocator;
-    const types = @import("parse/types.zig");
     const T = struct {
         x: types.Bytecode,
         extraFields: []const struct {
