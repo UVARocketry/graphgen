@@ -25,6 +25,9 @@
 (pair
   name: (value_ref) @variable)
 
+(pair
+  enum_value: (identifier) @constant.enum)
+
 ; References
 (value_ref
   "#" @punctuation.special
