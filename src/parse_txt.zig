@@ -536,7 +536,12 @@ pub fn writeV2Txt(gpa: Allocator, columns: []const Column, mode: V2OutMode) ![]u
 
         switch (mode) {
             .raw => {
-                try writer.writeByte('!');
+                try writer.writeByte('#');
+
+                while (writer.end % 4 != 0) {
+                    try writer.writeByte(0);
+                }
+
                 try writer.writeAll(std.mem.sliceAsBytes(column.values));
                 try writer.writeByte('\n');
             },
