@@ -392,11 +392,17 @@ pub const Lexer = struct {
         }
         // space chars
         if (char <= 32) {
+            var newline = false;
             while (self.peekChar() <= 32) {
-                _ = self.eatChar();
+                if (self.eatChar() == '\n') {
+                    newline = true;
+                }
                 if (self.peekChar() == 0) {
                     break;
                 }
+            }
+            if (newline) {
+                return .newline;
             }
             return self.getNextToken(diagnostic);
         }
