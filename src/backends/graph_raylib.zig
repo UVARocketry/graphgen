@@ -149,9 +149,28 @@ fn pointInRect(p: rl.Vector2, r: rl.Rectangle) bool {
 }
 
 fn imageLineExSafe(img: *rl.Image, p1: rl.Vector2, p2: rl.Vector2, thick: i32, color: rl.Color) void {
-    const a = if (p1.x <= p2.x) p1 else p2;
-    const b = if (p1.x <= p2.x) p2 else p1;
-    rl.imageDrawLineEx(img, a, b, thick, color);
+    // raylib's ImageDrawLine shifts the shorter axis delta left by 16, which is
+    // undefined behaviour for negative values. Replicate its integer rounding
+    // and branch selection, then order the points so the shorter delta used by
+    // each branch is non-negative.
+    const x1: i32 = @intFromFloat(p1.x + 0.5);
+    const y1: i32 = @intFromFloat(p1.y + 0.5);
+    const x2: i32 = @intFromFloat(p2.x + 0.5);
+    const y2: i32 = @intFromFloat(p2.y + 0.5);
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const adx = @abs(dx);
+    const ady = @abs(dy);
+    const vertical = dx == 0 or ady >= adx;
+    const swap = if (vertical)
+        (if (ady > adx) dx < 0 else dy < 0)
+    else
+        dy < 0;
+    if (swap) {
+        rl.imageDrawLineEx(img, p2, p1, thick, color);
+    } else {
+        rl.imageDrawLineEx(img, p1, p2, thick, color);
+    }
 }
 
 fn readGraph(reader: *std.Io.Reader, gpa: Allocator) !void {
@@ -485,11 +504,7 @@ fn readGraph(reader: *std.Io.Reader, gpa: Allocator) !void {
                 nextX * xScale + hpad + ihpad + leftExtra,
                 nextY * yScale + vpad + ivpad,
             );
-            if (p1.y > p2.y) {
-                rl.imageDrawLineEx(&img, p2, p1, 3.0, colors[yKind % colors.len]);
-            } else {
-                rl.imageDrawLineEx(&img, p1, p2, 3.0, colors[yKind % colors.len]);
-            }
+            imageLineExSafe(&img, p1, p2, 3.0, colors[yKind % colors.len]);
         }
     }
 
@@ -624,11 +639,7 @@ fn readGraph(reader: *std.Io.Reader, gpa: Allocator) !void {
         const endRight = rp1.add(dirRight.multiply(.init(12, 12)));
         imageLineExSafe(&img, rp1, endRight, 3.0, .black);
 
-        if (rp1.y > rp2.y) {
-            rl.imageDrawLineEx(&img, rp2, rp1, 3.0, .black);
-        } else {
-            rl.imageDrawLineEx(&img, rp1, rp2, 3.0, .black);
-        }
+        imageLineExSafe(&img, rp1, rp2, 3.0, .black);
 
         const text = try gpa.dupeSentinel(u8, an.text, 0);
         defer gpa.free(text);

@@ -36,16 +36,14 @@ pub fn run(
     bytecode: *bc.BytecodeInterpreter,
 ) !void {
     var diagnostic: ?[]const u8 = null;
-    const cols = parseOut.parseDbgFile(io, gpa, pageAlloc, item.use, &diagnostic) catch |e| {
+    var parsed = parseOut.parseDbgFile(io, gpa, pageAlloc, item.use, &diagnostic) catch |e| {
         if (diagnostic) |message| {
             std.log.err("Failed to parse '{s}': {s}", .{ item.use, message });
         }
         return e;
     };
-    defer {
-        for (cols) |*col| col.deinit(gpa);
-        gpa.free(cols);
-    }
+    defer parsed.deinit(gpa, io);
+    const cols = parsed.columns;
 
     try runColumns(gpa, item, writer, bytecode, cols);
 }

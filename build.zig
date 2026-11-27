@@ -4,10 +4,18 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const noraylib = b.option(bool, "no-raylib", "disables building raylib") orelse false;
+
     const mod = b.addModule("debuggraph_zig", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
+
+    const options = b.addOptions();
+    options.addOption(bool, "raylib", !noraylib);
+    const optionsMod = options.createModule();
+
+    mod.addImport("options", optionsMod);
 
     const raylib_dep = b.dependency("raylib_zig", .{
         .target = target,
@@ -17,8 +25,10 @@ pub fn build(b: *std.Build) void {
     const raylib = raylib_dep.module("raylib"); // main raylib module
     // const raygui = raylib_dep.module("raygui"); // raygui module
     const raylib_artifact = raylib_dep.artifact("raylib"); // raylib C library
-    mod.addImport("raylib", raylib);
-    mod.linkLibrary(raylib_artifact);
+    if (!noraylib) {
+        mod.addImport("raylib", raylib);
+        mod.linkLibrary(raylib_artifact);
+    }
 
     const exe = b.addExecutable(.{
         .name = "debuggraph_zig",
@@ -28,6 +38,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "debuggraph_zig", .module = mod },
+                .{ .name = "options", .module = optionsMod },
             },
         }),
     });

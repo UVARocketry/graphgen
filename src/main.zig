@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const builtin = @import("builtin");
+const options = @import("options");
 const Allocator = std.mem.Allocator;
 const debuggraph_zig = @import("debuggraph_zig");
 const bc = debuggraph_zig.bc;
@@ -354,6 +355,9 @@ pub fn doRlgraph(
     stderr: *Io.Writer,
     args: []const []const u8,
 ) !void {
+    if (comptime !options.raylib) {
+        @panic("graph generator not built with raylib!");
+    }
     var start = std.Io.Clock.awake.now(io);
     defer {
         const end = std.Io.Clock.awake.now(io);
@@ -752,13 +756,9 @@ pub fn doPlot(
     }
 
     start = std.Io.Clock.awake.now(io);
-    const cols = try parseOut.parseDbgFile(io, gpa, pageAlloc, p.plots[0].read.str, &strDiagnostic);
-    defer {
-        for (cols) |*c| {
-            c.deinit(gpa);
-        }
-        gpa.free(cols);
-    }
+    var parsed = try parseOut.parseDbgFile(io, gpa, pageAlloc, p.plots[0].read.str, &strDiagnostic);
+    defer parsed.deinit(gpa, io);
+    const cols = parsed.columns;
     end = std.Io.Clock.awake.now(io);
     nanos = @floatFromInt(start.durationTo(end).nanoseconds);
     std.debug.print("dbg parse took {}s\n", .{nanos / 1.0e9});
@@ -806,7 +806,7 @@ pub fn listKeys(
     const filename = if (args.len >= 3) args[2] else "./debug_out.txt";
     var diagnostic: ?[]const u8 = null;
 
-    const v = parseOut.parseDbgFile(io, gpa, pageAlloc, filename, &diagnostic) catch |e| {
+    var parsed = parseOut.parseDbgFile(io, gpa, pageAlloc, filename, &diagnostic) catch |e| {
         if (diagnostic) |d| {
             defer gpa.free(d);
             try stdout.print("Error while parsing {s}:\n  ", .{filename});
@@ -815,16 +815,11 @@ pub fn listKeys(
         }
         return e;
     };
+    defer parsed.deinit(gpa, io);
+    const v = parsed.columns;
 
     for (v) |col| {
         try stdout.print("{s}\n", .{col.name});
-    }
-
-    defer {
-        for (v) |*col| {
-            col.deinit(gpa);
-        }
-        gpa.free(v);
     }
 }
 
@@ -842,13 +837,9 @@ pub fn cool(
             stderr.flush() catch {};
         }
     }
-    const cols = try parseOut.parseDbgFile(io, gpa, pageAlloc, "./debug_out_v2_22M.txt", &strDiagnostic);
-    defer {
-        for (cols) |*c| {
-            c.deinit(gpa);
-        }
-        gpa.free(cols);
-    }
+    var parsed = try parseOut.parseDbgFile(io, gpa, pageAlloc, "./debug_out_v2_22M.txt", &strDiagnostic);
+    defer parsed.deinit(gpa, io);
+    const cols = parsed.columns;
 
     var builder: bc.BytecodeBuilder = .{
         .arr = .empty,

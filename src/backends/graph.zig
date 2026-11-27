@@ -142,16 +142,14 @@ pub fn run(
 ) !void {
     var diagnostic: ?[]const u8 = null;
     const parseStart = std.Io.Clock.awake.now(io);
-    const cols = parseOut.parseDbgFile(io, gpa, pageAlloc, graphs.use, &diagnostic) catch |e| {
+    var parsed = parseOut.parseDbgFile(io, gpa, pageAlloc, graphs.use, &diagnostic) catch |e| {
         if (diagnostic) |message| {
             std.log.err("Failed to parse '{s}': {s}", .{ graphs.use, message });
         }
         return e;
     };
-    defer if (builtin.optimize != .fast) {
-        for (cols) |*col| col.deinit(gpa);
-        gpa.free(cols);
-    };
+    defer if (builtin.optimize != .fast) parsed.deinit(gpa, io);
+    const cols = parsed.columns;
 
     {
         const end = std.Io.Clock.awake.now(io);

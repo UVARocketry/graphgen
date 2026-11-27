@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 pub const Column = struct {
@@ -8,11 +7,25 @@ pub const Column = struct {
     values: []const f32,
     mmapRef: bool = false,
 
-    pub fn deinit(self: *Column, gpa: Allocator) void {
-        gpa.free(self.values);
+    pub fn deinit(self: *const Column, gpa: Allocator) void {
         if (!self.mmapRef) {
-            gpa.free(self.name);
+            gpa.free(self.values);
         }
+        gpa.free(self.name);
+    }
+};
+
+/// Columns returned by `parseDbgFile`, along with the memory map their values
+/// may point into. The map must outlive the columns.
+pub const Parsed = struct {
+    columns: []Column,
+    map: ?std.Io.File.MemoryMap = null,
+
+    pub fn deinit(self: *const Parsed, gpa: Allocator, io: std.Io) void {
+        for (self.columns) |*column| column.deinit(gpa);
+        gpa.free(self.columns);
+        var map = self.map;
+        if (map) |*m| m.destroy(io);
     }
 };
 
@@ -538,7 +551,7 @@ pub fn writeV2Txt(gpa: Allocator, columns: []const Column, mode: V2OutMode) ![]u
     return out.toOwnedSlice();
 }
 
-pub fn parseDbgFile(io: std.Io, gpa: Allocator, pageAlloc: Allocator, filename: []const u8, diagnostic: *?[]const u8) ![]Column {
+pub fn parseDbgFile(io: std.Io, gpa: Allocator, pageAlloc: Allocator, filename: []const u8, diagnostic: *?[]const u8) !Parsed {
     _ = pageAlloc;
     const mapStart = std.Io.Clock.awake.now(io);
     const file = try std.Io.Dir.cwd().openFile(
@@ -546,7 +559,7 @@ pub fn parseDbgFile(io: std.Io, gpa: Allocator, pageAlloc: Allocator, filename: 
         filename,
         .{ .mode = .read_only },
     );
-    defer if (builtin.optimize != .fast) file.close(io);
+    defer file.close(io);
 
     const stat = try file.stat(io);
     const size = stat.size;
@@ -559,7 +572,7 @@ pub fn parseDbgFile(io: std.Io, gpa: Allocator, pageAlloc: Allocator, filename: 
         },
         .offset = 0,
     });
-    defer if (builtin.optimize != .fast) map.destroy(io);
+    errdefer map.destroy(io);
     try map.read(io);
     {
         const end = std.Io.Clock.awake.now(io);
@@ -568,17 +581,17 @@ pub fn parseDbgFile(io: std.Io, gpa: Allocator, pageAlloc: Allocator, filename: 
         std.debug.print("data mmap took {}s\n", .{nanos / 1.0e9});
     }
     const start = std.Io.Clock.awake.now(io);
-    const v = if (std.mem.endsWith(u8, filename, ".csv"))
-        parseCsv(gpa, map.memory, diagnostic)
+    const columns = if (std.mem.endsWith(u8, filename, ".csv"))
+        try parseCsv(gpa, map.memory, diagnostic)
     else
-        parseDbgOut(gpa, map.memory, diagnostic);
+        try parseDbgOut(gpa, map.memory, diagnostic);
     {
         const end = std.Io.Clock.awake.now(io);
 
         const nanos: f64 = @floatFromInt(start.durationTo(end).nanoseconds);
         std.debug.print("data parse took {}s\n", .{nanos / 1.0e9});
     }
-    return v;
+    return .{ .columns = columns, .map = map };
 }
 
 pub const DebugFile = struct {
