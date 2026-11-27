@@ -26,6 +26,7 @@
   name: (value_ref) @variable)
 
 (pair
+  key: (identifier)
   enum_value: (identifier) @constant.enum)
 
 ; References
