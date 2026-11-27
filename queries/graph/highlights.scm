@@ -4,6 +4,7 @@
 ; Literals
 (string) @string
 (number) @number
+(negative_number) @number
 ; (boolean) @boolean
 (null) @constant.builtin
 
