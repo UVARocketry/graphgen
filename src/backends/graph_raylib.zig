@@ -644,7 +644,9 @@ fn readGraph(reader: *std.Io.Reader, gpa: Allocator) !void {
         const text = try gpa.dupeSentinel(u8, an.text, 0);
         defer gpa.free(text);
 
-        rl.imageDrawTextEx(&img, font, text, p2, 20, 2, .black);
+        const info = rl.measureTextEx(font, text, 20, 2);
+        const textPos = p2.add(.init(0, if (an.dy < 0) 3 else -info.y - 3));
+        rl.imageDrawTextEx(&img, font, text, textPos, 20, 2, .black);
     }
 
     const saveZ = try gpa.dupeSentinel(u8, savePath, 0);
