@@ -568,7 +568,7 @@ pub fn doKeyHelp(
 
     const key = args[2];
     if (std.mem.eql(u8, key, ".")) {
-        try writeColor(stdout, ansi.bold ++ ansi.blue, "Help for '.':\n");
+        // try writeColor(stdout, ansi.bold ++ ansi.blue, "Help for '.':\n");
         try printHelpFor(graph.Graphs, stdout, key, null);
         return;
     }
