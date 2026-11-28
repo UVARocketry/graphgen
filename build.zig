@@ -20,6 +20,7 @@ pub fn build(b: *std.Build) void {
     const raylib_dep = b.dependency("raylib_zig", .{
         .target = target,
         .optimize = optimize,
+        .config = "-DSUPPORT_FILEFORMAT_JPG=1",
     });
 
     const raylib = raylib_dep.module("raylib"); // main raylib module

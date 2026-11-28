@@ -55,6 +55,19 @@ fn niceStep(range: f32, targetTicks: f32) f32 {
     return nice * magnitude;
 }
 
+fn smallTick(gpa: Allocator, value: f32) ![:0]const u8 {
+    const intDigits: u32 = @intFromFloat(@ceil(std.math.log10(value)));
+    const subDigits = @min(intDigits, 5);
+    const floatDigits = 5 - subDigits;
+    std.debug.print("{}\n", .{floatDigits});
+    std.debug.print("{} {}\n", .{ value, value - @round(value) });
+    std.debug.print("{}\n", .{std.math.approxEqAbs(f32, 0.0, value - @round(value), 0.000001)});
+    return if (std.math.approxEqAbs(f32, 0.0, value - @round(value), 0.000001))
+        try std.fmt.allocPrintSentinel(gpa, "{}", .{value}, 0)
+    else
+        try std.fmt.allocPrintSentinel(gpa, "{d:.[1]}", .{ value, floatDigits }, 0);
+}
+
 fn drawXTick(
     img: *rl.Image,
     font: rl.Font,
@@ -68,7 +81,7 @@ fn drawXTick(
     rl.imageDrawLineEx(img, .init(px, plotTop), .init(px, plotBottom), 1, .light_gray);
     rl.imageDrawLineEx(img, .init(px, plotBottom), .init(px, plotBottom + tickLength), 2, .black);
 
-    const tickStr = try std.fmt.allocPrintSentinel(gpa, "{}", .{value}, 0);
+    const tickStr = try smallTick(gpa, value);
     defer gpa.free(tickStr);
 
     const info = rl.measureTextEx(font, tickStr, 20, 2);
@@ -96,8 +109,10 @@ fn drawYTick(
     rl.imageDrawLineEx(img, .init(plotLeft, py), .init(plotRight, py), 1, .light_gray);
     rl.imageDrawLineEx(img, .init(plotLeft - tickLength, py), .init(plotLeft, py), 2, .black);
 
-    const tickStr = try std.fmt.allocPrintSentinel(gpa, "{}", .{value}, 0);
+    const tickStr = try smallTick(gpa, value);
     defer gpa.free(tickStr);
+
+    std.debug.print("{s}\n", .{tickStr});
 
     const info = rl.measureTextEx(font, tickStr, 20, 2);
     rl.imageDrawTextEx(
@@ -347,9 +362,6 @@ fn readGraph(reader: *std.Io.Reader, gpa: Allocator) !void {
         mainHeight + vpad * 2 + ivpad * 2,
         .white,
     );
-    rl.setConfigFlags(.{ .window_hidden = true });
-    rl.initWindow(1, 1, "graphgen");
-    defer rl.closeWindow();
 
     // outer border
     rl.imageDrawLineEx(
@@ -689,6 +701,9 @@ pub fn run(
     defer allocW.deinit();
 
     rl.setTraceLogLevel(.none);
+    rl.setConfigFlags(.{ .window_hidden = true });
+    rl.initWindow(1, 1, "graphgen");
+    defer rl.closeWindow();
 
     try actualRun(io, gpa, pageAlloc, graphs, &allocW.writer, bytecode, .bare);
 
